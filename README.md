@@ -92,8 +92,14 @@ Securely deletes all ghostwire config and keys:
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │  CLI (cobra)                                                        │
-│    init | join | up | down | status | panic | enroll                │
+│    init | join | up | down | status | panic | enroll | gui | logs   │
 ├─────────────────────────────────────────────────────────────────────┤
+│  GUI                          │  Hardening                          │
+│    Web dashboard (localhost)  │    Encrypted logging (age)          │
+│    REST API + WebSocket       │    Memory compartments (mlock)      │
+│    Real-time status/peers     │    Canary tokens (tripwire/dead sw) │
+│                               │    Remote attestation               │
+├───────────────────────────────┼─────────────────────────────────────┤
 │  Mesh Layer                                                         │
 │    SWIM gossip, route table, NAT traversal, policy engine (CEL),    │
 │    certificate renewal                                              │
@@ -109,10 +115,10 @@ Securely deletes all ghostwire config and keys:
 │    DNS-over-HTTPS tunnel      │                                     │
 │    Direct UDP                 │                                     │
 ├───────────────────────────────┼─────────────────────────────────────┤
-│  Config                       │  PKI                                │
+│  Config                       │  PKI + Crypto                       │
 │    age + scrypt encryption    │    X.509 with custom extensions     │
 │    No identifiable headers    │    Ed25519 signing                  │
-│                               │    X25519 for WireGuard             │
+│                               │    X25519 + Kyber-768 (hybrid PQC)  │
 │                               │    24-hour certificate lifetime     │
 └───────────────────────────────┴─────────────────────────────────────┘
 ```
@@ -440,6 +446,248 @@ Config locations:
 
 ---
 
+## Encrypted logging
+
+Logs use age encryption with per-field sensitivity levels. Sensitive fields (IPs, node IDs, keys) are encrypted while metadata (timestamps, levels) remain searchable.
+
+### Log entry structure
+
+```go
+type Entry struct {
+    Time      time.Time
+    Level     Level        // Debug, Info, Warn, Error, Security
+    Message   string
+    Fields    map[string]interface{}
+    Sensitive *SensitiveFields  // Encrypted separately
+}
+```
+
+Sensitive fields encrypted with a log-specific age recipient. The private key stored separately (or derived from passphrase) allows decryption only when explicitly needed.
+
+### Rotation
+
+Logs rotate by size (default 10MB) and age (default 24 hours). Old logs compressed with gzip. Secure deletion overwrites files with random data before unlinking.
+
+### Reading logs
+
+```bash
+./ghostwire logs view --key ~/.config/gw/log.key
+./ghostwire logs search --pattern "error" --since 1h
+./ghostwire logs export --format json --output events.json
+```
+
+---
+
+## Memory compartmentalization
+
+Sensitive data (private keys, session secrets, tokens) stored in isolated memory regions with mlock to prevent swapping to disk.
+
+### Compartments
+
+| Name | Contents | Size limit |
+|------|----------|------------|
+| ca-keys | CA private key | 4KB |
+| node-keys | Node Ed25519/X25519 keys | 4KB |
+| session-keys | Ephemeral session secrets | 64KB |
+| tokens | Enrollment tokens, auth tokens | 16KB |
+| mesh-secrets | Gossip HMAC keys, mesh secret | 8KB |
+
+### Protection
+
+Each region:
+1. Allocated with guard pages (PROT_NONE) on both sides to catch overflows
+2. Locked in memory via mlock() (Unix) or VirtualLock() (Windows)
+3. Zeroed on deallocation before munlock
+4. Access tracked per-compartment with usage limits
+
+```go
+region, err := secure.Allocate("node-keys", 64)
+defer region.Free()  // Zeros and unlocks
+copy(region.Data(), privateKey)
+```
+
+The manager tracks total mlocked memory against system limits (typically 64KB unprivileged on Linux).
+
+---
+
+## Canary tokens
+
+Canaries detect compromise through three mechanisms:
+
+### Dead switch
+
+Requires periodic check-in. If check-in stops, an alert fires.
+
+```go
+canary := &Canary{
+    Type:     TypeDeadSwitch,
+    Interval: 1 * time.Hour,
+    Secret:   []byte("..."),
+}
+```
+
+The monitor goroutine expects signed check-ins within the interval. Missed check-in triggers the configured alert handler (webhook, log, custom callback).
+
+### Tripwire
+
+Triggers when accessed. Embed in files, endpoints, or database records that should never be touched.
+
+```go
+canary := &Canary{
+    Type:   TypeTripwire,
+    Secret: []byte("..."),
+}
+// When accessed:
+monitor.Trip(canaryID)
+```
+
+### Honeypot
+
+Fake credentials or endpoints that look valuable. Any use indicates attacker access.
+
+### Signing
+
+Canaries are signed with Ed25519. Check-ins must include a valid signature over (canary_id || timestamp) to prevent replay attacks.
+
+---
+
+## Remote attestation
+
+Nodes prove their integrity by signing claims about their binary hash, config hash, and system state.
+
+### Claim structure
+
+```go
+type AttestationClaim struct {
+    NodeID      string
+    BinaryHash  [32]byte   // SHA-256 of executable
+    ConfigHash  [32]byte   // SHA-256 of config
+    SystemInfo  SystemFingerprint
+    Timestamp   time.Time
+    Nonce       [16]byte   // From verifier challenge
+    Signature   []byte     // Ed25519 over marshaled claim
+}
+```
+
+SystemFingerprint includes OS, architecture, hostname (hashed), and boot time.
+
+### Verification
+
+The verifier maintains a registry of trusted binary hashes by version:
+
+```go
+verifier.AddTrustedHash("abc123...", "v1.2.0")
+verifier.AddTrustedHash("def456...", "v1.2.1")
+```
+
+Verification checks:
+1. Signature valid against node's known public key
+2. Nonce matches issued challenge (prevents replay)
+3. Timestamp within allowed clock skew (default ±5 minutes)
+4. BinaryHash in trusted set
+5. Claim not older than MaxAge (default 24 hours)
+
+### X.509 extension
+
+Attestation claims embedded in certificate extensions (OID 1.3.6.1.4.1.99999.1.7). Admin node verifies attestation during enrollment before issuing certificates.
+
+---
+
+## Post-quantum key exchange
+
+Hybrid key exchange combines X25519 (classical) with Kyber-768 (post-quantum) for defense against future quantum computers.
+
+### Hybrid keypair
+
+```go
+type KeyPair struct {
+    X25519Public   [32]byte
+    X25519Private  [32]byte
+    KyberPublic    []byte  // 1184 bytes
+    KyberPrivate   []byte  // 2400 bytes
+}
+```
+
+### Key encapsulation
+
+Sender side:
+```go
+shared, encap, err := pqc.Encapsulate(recipientPubKey)
+// encap.X25519 = 32 bytes (ephemeral public key)
+// encap.Kyber  = 1088 bytes (ciphertext)
+// shared.Key   = 64 bytes (combined secret)
+```
+
+Receiver side:
+```go
+shared, err := keyPair.Decapsulate(encap)
+```
+
+### Combined secret derivation
+
+```
+X25519_SS = X25519(ephemeral_private, recipient_public)
+Kyber_SS  = Kyber.Decapsulate(ciphertext, recipient_private)
+Combined  = SHA-512(X25519_SS || Kyber_SS)
+```
+
+The 64-byte combined secret provides 256 bits of classical security and 128+ bits of post-quantum security. An attacker must break both algorithms to recover the secret.
+
+### Transport integration
+
+Hybrid keys used during handshake to derive session keys. The resulting shared secret fed into HKDF to produce:
+- Encryption key (32 bytes, ChaCha20-Poly1305)
+- MAC key (32 bytes)
+- IV (12 bytes)
+
+---
+
+## Web GUI
+
+Browser-based management interface running on localhost with token authentication.
+
+### Starting
+
+```bash
+./ghostwire up --gui
+# or standalone:
+./ghostwire gui --listen 127.0.0.1:9999
+```
+
+Opens browser automatically with auth token in URL: `http://127.0.0.1:9999/?token=abc123...`
+
+### API endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| /api/status | GET | Mesh status (connected, node ID, uptime, traffic) |
+| /api/peers | GET | List of peers with IPs, endpoints, latency |
+| /api/connect | POST | Connect to mesh with passphrase |
+| /api/disconnect | POST | Disconnect from mesh |
+| /api/stats | GET | Traffic statistics |
+
+All endpoints require `?token=...` query param or `Authorization: Bearer ...` header.
+
+### WebSocket
+
+Real-time updates via `/ws?token=...`:
+
+```json
+{"type": "status", "data": {"connected": true, "node_id": "node-1", ...}}
+{"type": "peers", "data": [{"node_id": "peer-1", "mesh_ip": "10.100.0.2", ...}]}
+```
+
+Client receives updates when status or peer list changes. Ping/pong keepalive every 54 seconds.
+
+### Security
+
+- Token generated randomly (16 bytes hex encoded) at startup
+- Listens only on 127.0.0.1 by default
+- No CORS (same-origin only)
+- WebSocket upgrade requires valid token
+
+---
+
 ## Roles
 
 | Role | Purpose |
@@ -461,7 +709,10 @@ Roles encoded in certificate extensions and enforced by policy engine.
 ├── admin.enc      # Admin config with CA key (encrypted)
 ├── config.enc     # Node config (encrypted)
 ├── ca.crt         # CA certificate (distribute to nodes)
-└── logs/          # Optional encrypted logs
+├── log.key        # Log decryption key (age private key)
+├── canaries.json  # Canary token definitions
+├── trusted.json   # Trusted binary hashes for attestation
+└── logs/          # Encrypted logs (rotated by size/age)
 ```
 
 ## Requirements
@@ -469,8 +720,4 @@ Roles encoded in certificate extensions and enforced by policy engine.
 - Go 1.22+ to build
 - Root/admin for TUN device creation
 - macOS, Linux, or Windows
-
-## Status
-
-Phase 1-3 (core VPN, mesh networking, traffic obfuscation) are implemented. Phase 4 (canary tokens, memory compartmentalization, remote attestation) and Phase 5 (mobile clients, GUI, post-quantum key exchange) are planned.
 

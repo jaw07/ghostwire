@@ -19,6 +19,8 @@ require (
 	filippo.io/hpke v0.4.0 // indirect
 	github.com/andybalholm/brotli v1.0.6 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
+	github.com/cloudflare/circl v1.6.3 // indirect
+	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/miekg/dns v1.1.72 // indirect
