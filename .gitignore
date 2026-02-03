@@ -1,0 +1,57 @@
+# Binaries
+ghostwire
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Build output
+/bin/
+/dist/
+/build/
+
+# Test binary
+*.test
+
+# Coverage
+*.out
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Project planning (internal only)
+Plan.md
+PLAN.md
+plan.md
+*.plan
+
+# Config files (sensitive)
+*.enc
+*.key
+*.pem
+!*_test.pem
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+/tmp/
+*.tmp
+
+# Vendor (if not committing)
+# vendor/
