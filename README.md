@@ -62,28 +62,28 @@ Crypto
 Session flow as seen on the wire:
 
 ```
-Client                                     Server
-  |                                          |
-  |--- TLS 1.3 ClientHello ----------------->|
-  |<-- TLS 1.3 ServerHello + Finished -------|
-  |                                          |
-  |--- POST /api/v1/telemetry/{knock} ------>|  Knock: HKDF-derived path + headers
-  |    X-Request-ID: {hex}                   |
-  |    X-Client-Token: {hex}                 |
-  |    Content-Type: application/json        |
-  |    {"session_id":"...","event_count":1}  |  Body: plausible telemetry JSON
-  |                                          |
-  |<-- 101 Switching Protocols --------------|  WebSocket upgrade response
-  |    Upgrade: websocket                    |
-  |    Sec-WebSocket-Accept: {base64}        |
-  |                                          |
-  |--- [LenMask: 2 bytes] ----------------->|  Per-session XOR key for length field
-  |                                          |
-  |=== WebSocket binary frames =============>|  All subsequent traffic
-  |    [0x82][len][MASK key][payload]        |  RFC 6455 with MASK bit set
-  |                                          |
-  |    payload = [maskedLen:2][WG pkt][pad]  |  WG packet + 4-64 random bytes
-  |                                          |
+Client                                       Server
+  |                                            |
+  |-- TLS 1.3 ClientHello ------------------>  |
+  |<- TLS 1.3 ServerHello + Finished -------  |
+  |                                            |
+  |-- POST /api/v1/telemetry/{knock} ------->  |  HKDF-derived headers
+  |   X-Request-ID: {hex}                      |
+  |   X-Client-Token: {hex}                    |
+  |   Content-Type: application/json           |
+  |   {"session_id":"...","event_count":1}     |  Plausible telemetry
+  |                                            |
+  |<- 101 Switching Protocols ---------------  |  WebSocket upgrade
+  |   Upgrade: websocket                       |
+  |   Sec-WebSocket-Accept: {base64}           |
+  |                                            |
+  |-- [LenMask: 2 bytes] ------------------>   |  Per-session XOR key
+  |                                            |
+  |== WebSocket binary frames ==============>  |  All subsequent traffic
+  |   [0x82][len][MASK key][payload]           |  RFC 6455 + MASK bit
+  |                                            |
+  |   payload = [maskedLen:2][WG pkt][pad]     |  WG pkt + 4-64 rand
+  |                                            |
 ```
 
 ### Knock derivation
@@ -107,24 +107,24 @@ Validation: server recomputes knock for each known client across windows `{W, W-
 ### WebSocket frame format
 
 ```
-+-------+----+--------+----------+--------------------------------+
-| Byte  | Sz | Field  | Value    | Notes                          |
-+-------+----+--------+----------+--------------------------------+
-| 0     | 1  | Opcode | 0x82     | FIN=1, RSV=000, opcode=binary  |
-| 1     | 1  | Len    | 0x80|len | MASK bit set (client->server)  |
-| 2-3   | 2  | ExtLen | uint16   | If Len==126 (payload >= 126B)  |
-| 2-9   | 8  | ExtLen | uint64   | If Len==127 (payload >= 64KB)  |
-| var   | 4  | Mask   | random   | RFC 6455 masking key           |
-+-------+----+--------+----------+--------------------------------+
-|                  Masked payload                                  |
-+-------+----+--------+----------+--------------------------------+
-| +0    | 2  | RealLen| XOR'd    | BigEndian(realLen) XOR lenMask  |
-| +2    | var| Data   | WG pkt   | WireGuard packet (realLen B)   |
-| +2+rl | var| Pad    | random   | 4-64 bytes from crypto/rand    |
-+-------+----+--------+----------+--------------------------------+
++--------+------+----------+----------+---------------------------------+
+| Offset | Size | Field    | Value    | Notes                           |
++--------+------+----------+----------+---------------------------------+
+| 0      | 1    | Opcode   | 0x82     | FIN=1, RSV=000, opcode=binary   |
+| 1      | 1    | Len+Mask | 0x80|len | MASK bit set (client->server)   |
+| 2      | 2    | ExtLen16 | uint16   | Only if Len field == 126        |
+|  or 2  | 8    | ExtLen64 | uint64   | Only if Len field == 127        |
+| var    | 4    | MaskKey  | random   | RFC 6455 masking key            |
++--------+------+----------+----------+---------------------------------+
+|                   Masked payload (XOR'd with MaskKey)                 |
++--------+------+----------+----------+---------------------------------+
+| +0     | 2    | RealLen  | XOR'd    | BigEndian(realLen) XOR lenMask  |
+| +2     | var  | Data     | WG pkt   | WireGuard packet (realLen B)   |
+| +2+rl  | var  | Padding  | random   | 4-64 bytes from crypto/rand    |
++--------+------+----------+----------+---------------------------------+
 
-lenMask = 2 random bytes, sent as first message after WebSocket upgrade
-Payload is XOR'd with the 4-byte mask key per RFC 6455 Section 5.3
+lenMask  = 2 random bytes, sent as first message after WebSocket upgrade
+MaskKey  = 4 random bytes per frame, per RFC 6455 Section 5.3
 Padding length derived from crypto/rand (not from payload content)
 ```
 
@@ -153,27 +153,26 @@ Root CA (Ed25519, 2-year validity, offline)
 ### Enrollment flow
 
 ```
-Admin                                  New Node
-  |                                      |
-  |  1. Generate token:                  |
-  |     token = Sign(CA_key, {id,        |
-  |       mesh_id, roles, not_before,    |
-  |       not_after, max_uses})          |
-  |                                      |
-  |<---- POST /enroll {token, pubkey} ---|  2. Node generates Ed25519 + X25519
-  |                                      |
-  |  3. Validate token signature         |
-  |     Check expiry, usage count        |
-  |     Allocate mesh IP                 |
-  |     Issue X.509 certificate          |
-  |                                      |
-  |---- {cert, ca_cert, peers, --------->|  4. Response includes mesh config
-  |      mesh_secret, transport}         |
-  |                                      |
-  |                                      |  5. Node verifies:
-  |                                      |     SHA-256(ca_cert.pubkey)
-  |                                      |       == token.mesh_id
-  |                                      |     cert chains to ca_cert
+Admin                                            New Node
+  |                                                |
+  |  1. Generate token:                            |
+  |     token = Sign(CA_key, {id, mesh_id,         |
+  |       roles, not_before, not_after, max_uses}) |
+  |                                                |
+  |<--- POST /enroll {token, pubkey} --------------| 2. Generate Ed25519 + X25519
+  |                                                |
+  |  3. Validate token signature                   |
+  |     Check expiry, usage count                  |
+  |     Allocate mesh IP                           |
+  |     Issue X.509 certificate                    |
+  |                                                |
+  |--- {cert, ca_cert, peers, ------------------->| 4. Mesh config response
+  |     mesh_secret, transport}                    |
+  |                                                |
+  |                                                | 5. Node verifies:
+  |                                                |    SHA-256(ca_cert.pubkey)
+  |                                                |      == token.mesh_id
+  |                                                |    cert chains to ca_cert
 ```
 
 Step 5 prevents MITM: an attacker substituting a rogue CA would fail the fingerprint check because the mesh ID is embedded in the token signed by the real CA.
@@ -181,15 +180,15 @@ Step 5 prevents MITM: an attacker substituting a rogue CA would fail the fingerp
 ### Certificate renewal
 
 ```
-Node                                          Admin
-  |                                             |
-  |  nonce = random(16 bytes)                   |
-  |  sig = Sign(node_key,                      |
-  |          "node_id:cert_hash:nonce:ts")     |
-  |                                             |
-  |-- POST /renew --------------------------->  |
-  |   {node_id, cert_hash, nonce, ts, sig}      |
-  |                                             |
+Node                                           Admin
+  |                                              |
+  |  nonce = random(16 bytes)                    |
+  |  sig = Sign(node_key,                       |
+  |          "node_id:cert_hash:nonce:ts")      |
+  |                                              |
+  |-- POST /renew ----------------------------->  |
+  |   {node_id, cert_hash, nonce, ts, sig}       |
+  |                                              |
   |                          Verify sig against  |
   |                          registered key      |
   |                          (not request key)   |
@@ -198,9 +197,9 @@ Node                                          Admin
   |                          nonce               |
   |                          Preserve roles      |
   |                          from current cert   |
-  |                                             |
-  |  <-- {new_cert, expires_at} --------------  |
-  |                                             |
+  |                                              |
+  |<- {new_cert, expires_at} -----------------   |
+  |                                              |
 ```
 
 ## Key derivation
@@ -428,31 +427,31 @@ Traffic path:
 Hybrid X25519 + Kyber-768 (ML-KEM). Both must be broken to recover the shared secret.
 
 ```
-Alice                                      Bob
-  |                                          |
-  |  x25519_eph = random X25519 keypair      |
-  |  kyber_eph  = random Kyber-768 keypair   |
-  |                                          |
-  |--- x25519_eph.pub, kyber_eph.pub ------->|
-  |                                          |
-  |          x25519_ss = X25519(bob_priv,    |
-  |                        alice_x25519_pub) |
-  |          kyber_ss, kyber_ct =            |
-  |            Kyber.Encapsulate(            |
-  |              alice_kyber_pub)            |
-  |                                          |
-  |<-- kyber_ct (1088 bytes) ----------------|
-  |                                          |
-  |  x25519_ss = X25519(alice_priv,          |
-  |                bob_x25519_pub)           |
-  |  kyber_ss = Kyber.Decapsulate(           |
-  |               kyber_ct, alice_kyber_priv)|
-  |                                          |
-  |  shared = SHA-512(x25519_ss || kyber_ss) |  64 bytes
-  |         = SHA-512(32 bytes  || 32 bytes) |
-  |                                          |
-  |  encryption_key = shared[0:32]           |  ChaCha20-Poly1305
-  |  mac_key        = shared[32:64]          |
+Alice                                            Bob
+  |                                                |
+  |  x25519_eph = random X25519 keypair            |
+  |  kyber_eph  = random Kyber-768 keypair         |
+  |                                                |
+  |--- x25519_eph.pub, kyber_eph.pub ------------>|
+  |                                                |
+  |                     x25519_ss = X25519(        |
+  |                       bob_priv, alice_x25519)  |
+  |                     kyber_ss, kyber_ct =       |
+  |                       Kyber.Encapsulate(       |
+  |                         alice_kyber_pub)       |
+  |                                                |
+  |<-- kyber_ct (1088 bytes) ----------------------|
+  |                                                |
+  |  x25519_ss = X25519(                           |
+  |    alice_priv, bob_x25519_pub)                 |
+  |  kyber_ss = Kyber.Decapsulate(                 |
+  |    kyber_ct, alice_kyber_priv)                 |
+  |                                                |
+  |  shared = SHA-512(x25519_ss || kyber_ss)       |  64 bytes
+  |         = SHA-512(32 bytes  || 32 bytes)       |
+  |                                                |
+  |  encryption_key = shared[0:32]                 |  ChaCha20-Poly1305
+  |  mac_key        = shared[32:64]                |
 ```
 
 Security: 128-bit classical (X25519) + 128-bit post-quantum (Kyber-768). Combined via SHA-512 ensures the stronger primitive dominates.
@@ -460,32 +459,27 @@ Security: 128-bit classical (X25519) + 128-bit post-quantum (Kyber-768). Combine
 ## NAT traversal
 
 ```
-Node A                    Relay                    Node B
-(behind NAT)                                       (behind NAT)
-  |                         |                         |
-  |  STUN query             |                         |
-  |  stun.l.google.com      |                         |
-  |  :19302                 |                         |
-  |<-- external addr A' --- |                         |
-  |                         |                         |
-  |-- HolePunchReq -------> |                         |
-  |   {A', B'}              |                         |
-  |                         |-- forward ------------>>|
-  |                         |                         |
-  |                         |            STUN query   |
-  |                         |                         |
-  |                         |   external addr B' -->> |
-  |                         |                         |
-  |<<===== 5 UDP packets at 50ms intervals =======>>>>>|
-  |        (both sides send simultaneously)            |
-  |                         |                         |
-  |  NAT mapping opens:     |                         |
-  |  outbound pkt matches   |                         |
-  |  inbound source addr    |                         |
-  |                         |                         |
-  |<<========= direct WireGuard tunnel ===========>>>>>|
-  |            relay no longer needed                  |
-  |                         |                         |
+Node A (behind NAT)            Relay             Node B (behind NAT)
+  |                              |                  |
+  |  STUN query to               |                  |
+  |  stun.l.google.com:19302     |                  |
+  |<-- external addr A' ---------|                  |
+  |                              |                  |
+  |--- HolePunchReq{A', B'} --->|                  |
+  |                              |--- forward ----->|
+  |                              |                  |
+  |                              |    STUN query    |
+  |                              |<-- addr B' ------|
+  |                              |                  |
+  |<======= 5 UDP packets at 50ms intervals ======>|
+  |          (both sides send simultaneously)       |
+  |                              |                  |
+  |  NAT mapping opens:          |                  |
+  |  outbound pkt matches        |                  |
+  |  inbound source addr         |                  |
+  |                              |                  |
+  |<=========== direct WireGuard tunnel ==========>|
+  |              (relay no longer needed)           |
 ```
 
 NAT classification via STUN:
