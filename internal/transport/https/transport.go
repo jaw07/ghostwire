@@ -51,7 +51,7 @@ func New(cfg *Config) (*Transport, error) {
 		t.tlsConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			NextProtos:   []string{"h2", "http/1.1"},
-			MinVersion:   tls.VersionTLS12,
+			MinVersion:   tls.VersionTLS13,
 		}
 	}
 
@@ -61,6 +61,26 @@ func New(cfg *Config) (*Transport, error) {
 // Name returns the transport identifier
 func (t *Transport) Name() string {
 	return Name
+}
+
+// ServerName returns the configured TLS server name
+func (t *Transport) ServerName() string {
+	return t.cfg.ServerName
+}
+
+// GenerateKnock creates a knock sequence using the local public key
+func (t *Transport) GenerateKnock() *KnockSequence {
+	return t.knockGenerator.Generate(t.cfg.LocalPublicKey)
+}
+
+// ValidateKnock validates a raw HTTP request as a knock sequence.
+// Returns the peer's public key if valid, nil otherwise.
+func (t *Transport) ValidateKnock(data []byte) []byte {
+	req, err := parseHTTPRequest(data)
+	if err != nil {
+		return nil
+	}
+	return t.knockValidator.Validate(req)
 }
 
 // AddPeer adds a peer's public key for knock validation
@@ -91,9 +111,10 @@ func (t *Transport) Dial(ctx context.Context, addr string) (net.Conn, error) {
 	}
 
 	tlsConfig := &tls.Config{
-		ServerName: t.cfg.ServerName,
-		NextProtos: []string{"h2", "http/1.1"},
-		MinVersion: tls.VersionTLS12,
+		ServerName:         t.cfg.ServerName,
+		NextProtos:         []string{"h2", "http/1.1"},
+		MinVersion:         tls.VersionTLS13,
+		InsecureSkipVerify: true, // Peer authentication is via WireGuard Noise + knock, not TLS PKI
 	}
 
 	tlsConn := tls.Client(tcpConn, tlsConfig)
@@ -214,25 +235,40 @@ type httpsListener struct {
 	tunnelCh  chan net.Conn
 	mu        sync.Mutex
 	closed    bool
+	accepting bool
 }
 
 func (l *httpsListener) Accept() (net.Conn, error) {
+	// Start a goroutine to accept raw connections and handle knock auth
+	l.mu.Lock()
+	if !l.accepting {
+		l.accepting = true
+		go l.acceptLoop()
+	}
+	l.mu.Unlock()
+
+	// Block until an authenticated tunnel connection is ready
+	tunnelConn, ok := <-l.tunnelCh
+	if !ok {
+		return nil, net.ErrClosed
+	}
+	return tunnelConn, nil
+}
+
+func (l *httpsListener) acceptLoop() {
 	for {
 		conn, err := l.listener.Accept()
 		if err != nil {
-			return nil, err
-		}
-
-		// Handle connection in goroutine to check for knock
-		go l.handleConnection(conn)
-
-		// Wait for authenticated connection
-		select {
-		case tunnelConn := <-l.tunnelCh:
-			return tunnelConn, nil
-		default:
+			l.mu.Lock()
+			closed := l.closed
+			l.mu.Unlock()
+			if closed {
+				close(l.tunnelCh)
+				return
+			}
 			continue
 		}
+		go l.handleConnection(conn)
 	}
 }
 

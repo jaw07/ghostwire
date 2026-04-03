@@ -35,49 +35,49 @@ func (tc *TunnelConn) Read(b []byte) (int, error) {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 
-	// If we have buffered data, return it first
-	if tc.readOffset < len(tc.readBuf) {
-		n := copy(b, tc.readBuf[tc.readOffset:])
-		tc.readOffset += n
-		if tc.readOffset >= len(tc.readBuf) {
-			tc.readBuf = nil
+	for {
+		// If we have buffered data, return it first
+		if tc.readOffset < len(tc.readBuf) {
+			n := copy(b, tc.readBuf[tc.readOffset:])
+			tc.readOffset += n
+			if tc.readOffset >= len(tc.readBuf) {
+				tc.readBuf = nil
+				tc.readOffset = 0
+			}
+			return n, nil
+		}
+
+		// Read next frame
+		frame, err := tc.reader.ReadFrame()
+		if err != nil {
+			return 0, err
+		}
+
+		switch frame.Type {
+		case FrameTypeData:
+			// Copy data to buffer
+			if len(frame.Payload) <= len(b) {
+				return copy(b, frame.Payload), nil
+			}
+			// Buffer excess data
+			n := copy(b, frame.Payload)
+			tc.readBuf = frame.Payload[n:]
 			tc.readOffset = 0
+			return n, nil
+
+		case FrameTypePing:
+			// Respond with ping and loop to read next frame
+			tc.writer.WriteFrame(NewPingFrame())
+			continue
+
+		case FrameTypeClose:
+			tc.closed = true
+			return 0, net.ErrClosed
+
+		default:
+			// Unknown frame type - skip and loop
+			continue
 		}
-		return n, nil
-	}
-
-	// Read next frame
-	frame, err := tc.reader.ReadFrame()
-	if err != nil {
-		return 0, err
-	}
-
-	switch frame.Type {
-	case FrameTypeData:
-		// Copy data to buffer
-		if len(frame.Payload) <= len(b) {
-			return copy(b, frame.Payload), nil
-		}
-		// Buffer excess data
-		n := copy(b, frame.Payload)
-		tc.readBuf = frame.Payload[n:]
-		tc.readOffset = 0
-		return n, nil
-
-	case FrameTypePing:
-		// Respond with ping and read again
-		tc.writer.WriteFrame(NewPingFrame())
-		tc.mu.Unlock()
-		return tc.Read(b)
-
-	case FrameTypeClose:
-		tc.closed = true
-		return 0, net.ErrClosed
-
-	default:
-		// Unknown frame type - skip and read again
-		tc.mu.Unlock()
-		return tc.Read(b)
 	}
 }
 

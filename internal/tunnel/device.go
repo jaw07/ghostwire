@@ -2,6 +2,7 @@
 package tunnel
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/netip"
@@ -19,6 +20,7 @@ import (
 type Device struct {
 	wgDevice   *device.Device
 	tunDevice  tun.Device
+	wgBind     conn.Bind // retained for listener management
 	privateKey [32]byte
 	publicKey  [32]byte
 	meshIP     netip.Addr
@@ -154,6 +156,7 @@ func New(cfg *Config) (*Device, error) {
 	d := &Device{
 		wgDevice:   wgDev,
 		tunDevice:  tunDev,
+		wgBind:     wgBind,
 		privateKey: cfg.PrivateKey,
 		publicKey:  publicKey,
 		meshIP:     cfg.MeshIP,
@@ -188,21 +191,27 @@ func NewFromConfig(meshCfg *config.MeshConfig, privateKey [32]byte, meshSecret [
 		LogLevel:      1,
 	}
 
+	// Derive local public key for transport authentication (knock)
+	var localPubKey [32]byte
+	curve25519.ScalarBaseMult(&localPubKey, &privateKey)
+
 	// Configure transport based on mesh config
 	switch meshCfg.Transport.Active {
 	case "https-mimic", "https":
 		cfg.TransportMode = "https"
 		cfg.HTTPSConfig = &BindConfig{
-			ServerName: meshCfg.Transport.HTTPS.ServerName,
-			MeshSecret: meshSecret,
-			ListenAddr: meshCfg.Transport.HTTPS.ListenAddr,
+			ServerName:     meshCfg.Transport.HTTPS.ServerName,
+			MeshSecret:     meshSecret,
+			ListenAddr:     meshCfg.Transport.HTTPS.ListenAddr,
+			LocalPublicKey: localPubKey[:],
 		}
 	case "hybrid":
 		cfg.TransportMode = "hybrid"
 		cfg.HTTPSConfig = &BindConfig{
-			ServerName: meshCfg.Transport.HTTPS.ServerName,
-			MeshSecret: meshSecret,
-			ListenAddr: meshCfg.Transport.HTTPS.ListenAddr,
+			ServerName:     meshCfg.Transport.HTTPS.ServerName,
+			MeshSecret:     meshSecret,
+			ListenAddr:     meshCfg.Transport.HTTPS.ListenAddr,
+			LocalPublicKey: localPubKey[:],
 		}
 	case "direct", "":
 		cfg.TransportMode = "direct"
@@ -297,7 +306,7 @@ func (d *Device) AddPeer(peer *Peer) error {
 
 	// Configure peer in WireGuard
 	ipcConfig := fmt.Sprintf(
-		"public_key=%s\nallowed_ips=%s/32\n",
+		"public_key=%s\nallowed_ip=%s/32\n",
 		keyToHex(peer.PublicKey[:]),
 		peer.MeshIP,
 	)
@@ -418,6 +427,30 @@ type Stats struct {
 	PeerCount     int
 	BytesSent     uint64
 	BytesReceived uint64
+}
+
+// RegisterKnockPeer registers a peer's public key with the HTTPS transport's
+// knock validator so the peer can authenticate incoming connections.
+func (d *Device) RegisterKnockPeer(pubKey []byte) {
+	if httpsBind, ok := d.wgBind.(*HTTPSBind); ok && httpsBind.transport != nil {
+		httpsBind.transport.AddPeer(pubKey)
+	}
+	if hybridBind, ok := d.wgBind.(*HybridBind); ok && hybridBind.httpsBind != nil && hybridBind.httpsBind.transport != nil {
+		hybridBind.httpsBind.transport.AddPeer(pubKey)
+	}
+}
+
+// StartTransportListener starts the HTTPS bind's incoming connection listener.
+// This must be called after Up() for nodes that need to accept incoming tunnel connections.
+func (d *Device) StartTransportListener(addr string, tlsConfig *tls.Config) error {
+	if httpsBind, ok := d.wgBind.(*HTTPSBind); ok {
+		return httpsBind.StartListener(addr, tlsConfig)
+	}
+	if hybridBind, ok := d.wgBind.(*HybridBind); ok && hybridBind.httpsBind != nil {
+		return hybridBind.httpsBind.StartListener(addr, tlsConfig)
+	}
+	// Direct bind doesn't need a listener (uses UDP)
+	return nil
 }
 
 // keyToHex converts a key to hex string for WireGuard IPC

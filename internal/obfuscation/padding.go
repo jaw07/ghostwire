@@ -470,32 +470,33 @@ func (oc *ObfuscatedConn) Read(b []byte) (int, error) {
 		return n, nil
 	}
 
-	// Read from underlying connection
 	buf := make([]byte, 65536)
-	n, err := oc.Conn.Read(buf)
-	if err != nil {
-		return 0, err
-	}
+	for {
+		// Read from underlying connection
+		n, err := oc.Conn.Read(buf)
+		if err != nil {
+			return 0, err
+		}
 
-	// Check for decoy (first byte = 0x00)
-	if n > 0 && buf[0] == 0x00 {
-		// Discard decoy, read again
-		return oc.Read(b)
-	}
+		// Check for decoy (first byte = 0x00) — discard and loop
+		if n > 0 && buf[0] == 0x00 {
+			continue
+		}
 
-	// Unpad
-	data, err := oc.padder.Unpad(buf[:n])
-	if err != nil {
-		return 0, err
-	}
+		// Unpad
+		data, err := oc.padder.Unpad(buf[:n])
+		if err != nil {
+			return 0, err
+		}
 
-	// Copy to output
-	copied := copy(b, data)
-	if copied < len(data) {
-		oc.readBuf = data[copied:]
-	}
+		// Copy to output
+		copied := copy(b, data)
+		if copied < len(data) {
+			oc.readBuf = data[copied:]
+		}
 
-	return copied, nil
+		return copied, nil
+	}
 }
 
 func (oc *ObfuscatedConn) Write(b []byte) (int, error) {

@@ -160,6 +160,10 @@ func executePanic(configDir string, wipeConfig, wipeLogs, silent bool) error {
 	if !silent {
 		fmt.Println()
 		fmt.Println("Panic complete. All requested data has been securely wiped.")
+		fmt.Println()
+		fmt.Println("NOTE: On copy-on-write filesystems (macOS APFS, Btrfs), original data")
+		fmt.Println("      blocks may persist in filesystem journals or snapshots. For maximum")
+		fmt.Println("      security, use full-disk encryption and securely erase the entire volume.")
 	}
 
 	return nil

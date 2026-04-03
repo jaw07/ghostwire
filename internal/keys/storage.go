@@ -3,8 +3,6 @@ package keys
 import (
 	"runtime"
 	"sync"
-
-	"golang.org/x/sys/unix"
 )
 
 // SecureBuffer holds sensitive data with memory protections.
@@ -29,28 +27,6 @@ func NewSecureBuffer(size int) *SecureBuffer {
 	}
 
 	return sb
-}
-
-// mlock prevents the memory from being swapped to disk.
-func (sb *SecureBuffer) mlock() error {
-	if runtime.GOOS == "windows" {
-		// Windows uses VirtualLock - not implemented yet
-		return nil
-	}
-
-	err := unix.Mlock(sb.data)
-	if err == nil {
-		sb.locked = true
-	}
-	return err
-}
-
-// munlock unlocks the memory, allowing it to be swapped.
-func (sb *SecureBuffer) munlock() {
-	if sb.locked {
-		unix.Munlock(sb.data)
-		sb.locked = false
-	}
 }
 
 // Write copies data into the secure buffer.

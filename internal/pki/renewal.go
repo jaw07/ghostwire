@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -48,6 +50,7 @@ type RenewalRequest struct {
 	CurrentCertHash string `json:"current_cert_hash"` // SHA-256 of current cert
 	PublicKey       string `json:"public_key"`        // Base64 Ed25519 public key
 	CSR             string `json:"csr,omitempty"`     // Optional CSR
+	Nonce           string `json:"nonce"`             // Random nonce for replay prevention
 	Timestamp       int64  `json:"timestamp"`
 	Signature       string `json:"signature"` // Signed with current key
 }
@@ -218,16 +221,24 @@ func (rs *RenewalService) doRenewal() error {
 		return fmt.Errorf("no current certificate")
 	}
 
+	// Generate random nonce for replay prevention
+	var nonceBytes [16]byte
+	if _, err := rand.Read(nonceBytes[:]); err != nil {
+		return fmt.Errorf("generate nonce: %w", err)
+	}
+	nonce := base64.StdEncoding.EncodeToString(nonceBytes[:])
+
 	// Build renewal request
 	req := &RenewalRequest{
 		NodeID:          extractNodeID(cert),
 		CurrentCertHash: certFingerprint(cert),
 		PublicKey:       base64.StdEncoding.EncodeToString(privateKey.Public().(ed25519.PublicKey)),
+		Nonce:           nonce,
 		Timestamp:       time.Now().Unix(),
 	}
 
-	// Sign the request
-	signData := []byte(fmt.Sprintf("%s:%s:%d", req.NodeID, req.CurrentCertHash, req.Timestamp))
+	// Sign the request (includes nonce)
+	signData := []byte(fmt.Sprintf("%s:%s:%s:%d", req.NodeID, req.CurrentCertHash, req.Nonce, req.Timestamp))
 	signature := ed25519.Sign(privateKey, signData)
 	req.Signature = base64.StdEncoding.EncodeToString(signature)
 
@@ -300,22 +311,31 @@ func extractNodeID(cert *x509.Certificate) string {
 }
 
 func certFingerprint(cert *x509.Certificate) string {
-	return base64.StdEncoding.EncodeToString(cert.Raw[:32])
+	hash := sha256.Sum256(cert.Raw)
+	return base64.StdEncoding.EncodeToString(hash[:])
 }
 
 // RenewalHandler handles renewal requests on the admin side
 type RenewalHandler struct {
 	ca         *CertificateAuthority
-	validCerts map[string]bool // nodeID -> has valid cert
+	nodeCerts  map[string]*x509.Certificate // nodeID -> current cert
+	seenNonces map[string]int64             // nonce -> expiry unix timestamp
 	mu         sync.RWMutex
 }
 
 // NewRenewalHandler creates a renewal handler for admin nodes
 func NewRenewalHandler(ca *CertificateAuthority) *RenewalHandler {
 	return &RenewalHandler{
-		ca:         ca,
-		validCerts: make(map[string]bool),
+		ca:        ca,
+		nodeCerts: make(map[string]*x509.Certificate),
 	}
+}
+
+// RegisterNodeCert registers (or updates) a node's current certificate for renewal verification
+func (rh *RenewalHandler) RegisterNodeCert(nodeID string, cert *x509.Certificate) {
+	rh.mu.Lock()
+	defer rh.mu.Unlock()
+	rh.nodeCerts[nodeID] = cert
 }
 
 // HandleRenewal processes a renewal request
@@ -337,13 +357,48 @@ func (rh *RenewalHandler) HandleRenewal(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Decode and verify signature
-	pubKeyBytes, err := base64.StdEncoding.DecodeString(req.PublicKey)
-	if err != nil || len(pubKeyBytes) != ed25519.PublicKeySize {
-		http.Error(w, "invalid public key", http.StatusBadRequest)
+	// Reject empty nonce
+	if req.Nonce == "" {
+		http.Error(w, "missing nonce", http.StatusBadRequest)
 		return
 	}
-	pubKey := ed25519.PublicKey(pubKeyBytes)
+
+	// Reject replayed nonce
+	rh.mu.Lock()
+	if rh.seenNonces == nil {
+		rh.seenNonces = make(map[string]int64)
+	}
+	now := time.Now().Unix()
+	// Prune expired nonces
+	for k, exp := range rh.seenNonces {
+		if now > exp {
+			delete(rh.seenNonces, k)
+		}
+	}
+	if _, seen := rh.seenNonces[req.Nonce]; seen {
+		rh.mu.Unlock()
+		http.Error(w, "replayed request", http.StatusBadRequest)
+		return
+	}
+	rh.seenNonces[req.Nonce] = now + 300 // 5 minute TTL
+	rh.mu.Unlock()
+
+	// Look up the node's current certificate to verify ownership
+	rh.mu.RLock()
+	currentCert, known := rh.nodeCerts[req.NodeID]
+	rh.mu.RUnlock()
+
+	if !known || currentCert == nil {
+		http.Error(w, "unknown node", http.StatusUnauthorized)
+		return
+	}
+
+	// Verify the request is signed with the key from the node's current certificate
+	registeredPubKey, ok := currentCert.PublicKey.(ed25519.PublicKey)
+	if !ok {
+		http.Error(w, "invalid certificate key type", http.StatusInternalServerError)
+		return
+	}
 
 	sigBytes, err := base64.StdEncoding.DecodeString(req.Signature)
 	if err != nil {
@@ -351,19 +406,36 @@ func (rh *RenewalHandler) HandleRenewal(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	signData := []byte(fmt.Sprintf("%s:%s:%d", req.NodeID, req.CurrentCertHash, req.Timestamp))
-	if !ed25519.Verify(pubKey, signData, sigBytes) {
+	signData := []byte(fmt.Sprintf("%s:%s:%s:%d", req.NodeID, req.CurrentCertHash, req.Nonce, req.Timestamp))
+	if !ed25519.Verify(registeredPubKey, signData, sigBytes) {
 		http.Error(w, "signature verification failed", http.StatusUnauthorized)
 		return
 	}
 
-	// Issue new certificate
-	// Preserve existing roles from the previous certificate
+	// Verify the cert hash matches the registered certificate
+	expectedHash := certFingerprint(currentCert)
+	if req.CurrentCertHash != expectedHash {
+		http.Error(w, "certificate hash mismatch", http.StatusUnauthorized)
+		return
+	}
+
+	// Extract roles and other attributes from the current certificate
+	currentExt, err := ParseExtensions(currentCert.Extensions)
+	if err != nil {
+		http.Error(w, "failed to parse current certificate extensions", http.StatusInternalServerError)
+		return
+	}
+
+	// Issue new certificate preserving roles from the current cert
 	certReq := &NodeCertRequest{
-		NodeID:    req.NodeID,
-		PublicKey: pubKey,
-		Roles:     []string{"operator"}, // Default, should lookup from previous cert
-		Validity:  24 * time.Hour,
+		NodeID:          req.NodeID,
+		PublicKey:       registeredPubKey,
+		Roles:           currentExt.Roles,
+		AllowedNetworks: currentExt.AllowedNetworks,
+		Compartment:     currentExt.Compartment,
+		WireGuardPubKey: currentExt.WireGuardPubKey,
+		MeshIP:          currentCert.IPAddresses[0],
+		Validity:        24 * time.Hour,
 	}
 
 	newCert, _, err := rh.ca.IssueCertificate(certReq)
@@ -371,6 +443,11 @@ func (rh *RenewalHandler) HandleRenewal(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "certificate issuance failed", http.StatusInternalServerError)
 		return
 	}
+
+	// Update the registered cert for this node
+	rh.mu.Lock()
+	rh.nodeCerts[req.NodeID] = newCert
+	rh.mu.Unlock()
 
 	// Encode certificate
 	certPEM := pem.EncodeToMemory(&pem.Block{

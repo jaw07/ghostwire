@@ -178,9 +178,10 @@ func initializeMesh(meshName, outputDir, subnet, nodeID, serverName, listenAddr,
 			Transport: config.TransportConfig{
 				Active: "https-mimic",
 				HTTPS: config.HTTPSTransportConfig{
-					ServerName:  serverName,
-					Fingerprint: "auto",
-					ListenAddr:  listenAddr,
+					ServerName:          serverName,
+					Fingerprint:         "auto",
+					ListenAddr:          listenAddr,
+					TransportListenAddr: ":8444",
 				},
 				Direct: config.DirectTransportConfig{
 					Enabled: true,

@@ -1,8 +1,11 @@
 package tunnel
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -14,6 +17,183 @@ import (
 
 	"github.com/ghostwire/ghostwire/internal/transport/https"
 )
+
+// wsConn wraps a net.Conn with WebSocket binary framing.
+// This makes post-knock WireGuard traffic look like a WebSocket session
+// to DPI systems. Each WireGuard packet is sent as a WebSocket binary frame
+// with randomized padding to resist traffic analysis.
+// The real payload length is XOR-masked with a per-session key to prevent
+// the length field from being used as a DPI fingerprint.
+type wsConn struct {
+	net.Conn
+	readBuf  []byte   // buffered payload from partially-read frame
+	lenMask  [2]byte  // per-session XOR mask for length field
+	isClient bool     // client frames are masked per RFC 6455
+}
+
+func newWSConn(c net.Conn) *wsConn {
+	var mask [2]byte
+	rand.Read(mask[:])
+	w := &wsConn{Conn: c, lenMask: mask, isClient: true}
+	// Send the mask as the first 2 bytes so the peer can decode lengths
+	c.Write(mask[:])
+	return w
+}
+
+func newWSConnServer(c net.Conn) *wsConn {
+	// Read the client's length mask
+	var mask [2]byte
+	io.ReadFull(c, mask[:])
+	return &wsConn{Conn: c, lenMask: mask, isClient: false}
+}
+
+// Write wraps data in a WebSocket binary frame: 0x82 + length + mask + payload
+func (w *wsConn) Write(b []byte) (int, error) {
+	// Add random padding (4-64 bytes) to resist packet-size analysis.
+	// Uses crypto/rand to prevent padding length from leaking payload content.
+	var padByte [1]byte
+	rand.Read(padByte[:])
+	padLen := 4 + int(padByte[0]%61)
+	padded := make([]byte, len(b)+padLen)
+	copy(padded, b)
+	rand.Read(padded[len(b):]) // random padding bytes
+
+	frame := encodeWSFrame(0x82, padded, len(b), w.lenMask, w.isClient) // 0x82 = binary, final
+	_, err := w.Conn.Write(frame)
+	if err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+// Read reads a WebSocket frame and returns the payload (without padding)
+func (w *wsConn) Read(b []byte) (int, error) {
+	// Return buffered data first
+	if len(w.readBuf) > 0 {
+		n := copy(b, w.readBuf)
+		w.readBuf = w.readBuf[n:]
+		return n, nil
+	}
+
+	payload, err := decodeWSFrame(w.Conn, w.lenMask)
+	if err != nil {
+		return 0, err
+	}
+
+	n := copy(b, payload)
+	if n < len(payload) {
+		w.readBuf = payload[n:]
+	}
+	return n, nil
+}
+
+// encodeWSFrame creates a WebSocket binary frame per RFC 6455.
+// Client frames include the MASK bit and a 4-byte masking key.
+func encodeWSFrame(opcode byte, data []byte, realLen int, lenMask [2]byte, masked bool) []byte {
+	totalLen := len(data) + 2 // +2 for masked realLen
+	var header []byte
+	lenByte := byte(0)
+	if masked {
+		lenByte = 0x80 // Set MASK bit per RFC 6455
+	}
+
+	if totalLen < 126 {
+		header = []byte{opcode, lenByte | byte(totalLen)}
+	} else if totalLen < 65536 {
+		header = []byte{opcode, lenByte | 126, byte(totalLen >> 8), byte(totalLen)}
+	} else {
+		header = make([]byte, 10)
+		header[0] = opcode
+		header[1] = lenByte | 127
+		binary.BigEndian.PutUint64(header[2:], uint64(totalLen))
+	}
+
+	// Generate masking key if client
+	var maskKey [4]byte
+	if masked {
+		rand.Read(maskKey[:])
+		header = append(header, maskKey[:]...)
+	}
+
+	// Build payload: maskedRealLen(2) + data
+	payload := make([]byte, 2+len(data))
+	var lenBytes [2]byte
+	binary.BigEndian.PutUint16(lenBytes[:], uint16(realLen))
+	payload[0] = lenBytes[0] ^ lenMask[0]
+	payload[1] = lenBytes[1] ^ lenMask[1]
+	copy(payload[2:], data)
+
+	// Apply masking per RFC 6455 if client
+	if masked {
+		for i := range payload {
+			payload[i] ^= maskKey[i%4]
+		}
+	}
+
+	frame := make([]byte, len(header)+len(payload))
+	copy(frame, header)
+	copy(frame[len(header):], payload)
+	return frame
+}
+
+// decodeWSFrame reads one WebSocket frame per RFC 6455 and returns the real payload
+func decodeWSFrame(r io.Reader, lenMask [2]byte) ([]byte, error) {
+	var hdr [2]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
+	}
+
+	isMasked := hdr[1]&0x80 != 0
+	payloadLen := uint64(hdr[1] & 0x7F)
+	switch payloadLen {
+	case 126:
+		var ext [2]byte
+		if _, err := io.ReadFull(r, ext[:]); err != nil {
+			return nil, err
+		}
+		payloadLen = uint64(binary.BigEndian.Uint16(ext[:]))
+	case 127:
+		var ext [8]byte
+		if _, err := io.ReadFull(r, ext[:]); err != nil {
+			return nil, err
+		}
+		payloadLen = binary.BigEndian.Uint64(ext[:])
+	}
+
+	// Read masking key if present (RFC 6455: client-to-server frames are masked)
+	var maskKey [4]byte
+	if isMasked {
+		if _, err := io.ReadFull(r, maskKey[:]); err != nil {
+			return nil, err
+		}
+	}
+
+	if payloadLen < 2 || payloadLen > 65536+2 {
+		return nil, fmt.Errorf("invalid ws frame length: %d", payloadLen)
+	}
+
+	buf := make([]byte, payloadLen)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+
+	// Unmask if needed
+	if isMasked {
+		for i := range buf {
+			buf[i] ^= maskKey[i%4]
+		}
+	}
+
+	// First 2 bytes are the XOR-masked real payload length
+	buf[0] ^= lenMask[0]
+	buf[1] ^= lenMask[1]
+	realLen := binary.BigEndian.Uint16(buf[:2])
+	if int(realLen) > len(buf)-2 {
+		return nil, fmt.Errorf("invalid real length: %d > %d", realLen, len(buf)-2)
+	}
+
+	return buf[2 : 2+realLen], nil
+}
 
 // HTTPSBind implements conn.Bind for tunneling WireGuard over HTTPS
 type HTTPSBind struct {
@@ -69,6 +249,9 @@ type BindConfig struct {
 	// MeshSecret for knock authentication
 	MeshSecret []byte
 
+	// LocalPublicKey is this node's WireGuard public key (for knock auth)
+	LocalPublicKey []byte
+
 	// ListenAddr for server mode (empty = client only)
 	ListenAddr string
 
@@ -79,8 +262,11 @@ type BindConfig struct {
 // NewHTTPSBind creates a new HTTPS-based WireGuard bind
 func NewHTTPSBind(cfg *BindConfig) (*HTTPSBind, error) {
 	transportCfg := &https.Config{
-		ServerName: cfg.ServerName,
-		MeshSecret: cfg.MeshSecret,
+		ServerName:     cfg.ServerName,
+		MeshSecret:     cfg.MeshSecret,
+		LocalPublicKey: cfg.LocalPublicKey,
+		KnockWindow:    https.DefaultKnockWindow,
+		Timeout:        https.DefaultTimeout,
 	}
 
 	transport, err := https.New(transportCfg)
@@ -97,13 +283,17 @@ func NewHTTPSBind(cfg *BindConfig) (*HTTPSBind, error) {
 	return b, nil
 }
 
-// Open implements conn.Bind
+// Open implements conn.Bind.
+// WireGuard calls Close() then Open() during device.Up(), so Open must
+// be able to reopen a previously closed bind.
 func (b *HTTPSBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	b.closeMu.Lock()
 	defer b.closeMu.Unlock()
 
+	// Reopen if previously closed (WireGuard lifecycle: Close -> Open on Up)
 	if b.closed {
-		return nil, 0, fmt.Errorf("bind is closed")
+		b.recvChan = make(chan recvPacket, 256)
+		b.closed = false
 	}
 
 	// Create receive function
@@ -124,7 +314,9 @@ func (b *HTTPSBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	return []conn.ReceiveFunc{recvFunc}, 443, nil
 }
 
-// Close implements conn.Bind
+// Close implements conn.Bind.
+// Closes the receive channel and active connections, but preserves the
+// transport so the bind can be reopened by a subsequent Open() call.
 func (b *HTTPSBind) Close() error {
 	b.closeMu.Lock()
 	defer b.closeMu.Unlock()
@@ -143,7 +335,9 @@ func (b *HTTPSBind) Close() error {
 	b.remoteConns = make(map[string]*httpsEndpoint)
 	b.connsMu.Unlock()
 
-	return b.transport.Close()
+	// Don't close the transport — it will be reused if Open is called again.
+	// The transport is only fully closed when the Device is closed.
+	return nil
 }
 
 // SetMark implements conn.Bind (no-op for HTTPS)
@@ -153,46 +347,118 @@ func (b *HTTPSBind) SetMark(mark uint32) error {
 
 // Send implements conn.Bind
 func (b *HTTPSBind) Send(bufs [][]byte, endpoint conn.Endpoint) error {
+	b.closeMu.Lock()
+	if b.closed {
+		b.closeMu.Unlock()
+		return net.ErrClosed
+	}
+	b.closeMu.Unlock()
+
 	ep, ok := endpoint.(*httpsEndpoint)
 	if !ok {
 		return fmt.Errorf("invalid endpoint type")
 	}
 
-	b.connsMu.RLock()
+	// Use write lock for full check-then-dial to prevent duplicate connections
+	b.connsMu.Lock()
 	existing, exists := b.remoteConns[ep.addr]
-	b.connsMu.RUnlock()
 
 	var c net.Conn
 	if exists && existing.conn != nil {
 		c = existing.conn
+		b.connsMu.Unlock()
 	} else {
-		// Establish new connection
+		b.connsMu.Unlock()
+
+		// Dial outside the lock (slow I/O operation)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		newConn, err := b.transport.Dial(ctx, ep.addr)
+		newConn, err := b.dialRaw(ctx, ep.addr)
 		if err != nil {
 			return fmt.Errorf("dial %s: %w", ep.addr, err)
 		}
 		c = newConn
 
+		// Re-check under lock — another goroutine may have connected
 		b.connsMu.Lock()
-		ep.conn = c
-		b.remoteConns[ep.addr] = ep
-		b.connsMu.Unlock()
+		if existing2, exists2 := b.remoteConns[ep.addr]; exists2 && existing2.conn != nil {
+			// Another goroutine won the race — close our connection and use theirs
+			b.connsMu.Unlock()
+			c.(*wsConn).Conn.Close()
+			c = existing2.conn
+		} else {
+			ep.conn = c
+			b.remoteConns[ep.addr] = ep
+			b.connsMu.Unlock()
 
-		// Start receiver goroutine for this connection
-		go b.receiveLoop(ep)
+			// Start receiver goroutine for this connection
+			go b.receiveLoop(ep)
+		}
 	}
 
 	// Send all buffers
 	for _, buf := range bufs {
 		if _, err := c.Write(buf); err != nil {
-			return fmt.Errorf("write: %w", err)
+			return fmt.Errorf("write to %s: %w", ep.addr, err)
 		}
 	}
+	// Packets sent
 
 	return nil
+}
+
+// dialRaw establishes a raw TLS connection with knock authentication.
+// Returns the raw TLS conn after knock handshake (no TunnelConn framing).
+func (b *HTTPSBind) dialRaw(ctx context.Context, addr string) (net.Conn, error) {
+	dialer := &net.Dialer{}
+	tcpConn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("dial tcp: %w", err)
+	}
+
+	tlsConfig := &tls.Config{
+		ServerName:         b.transport.ServerName(),
+		NextProtos:         []string{"h2", "http/1.1"},
+		MinVersion:         tls.VersionTLS13,
+		InsecureSkipVerify: true,
+	}
+
+	tlsConn := tls.Client(tcpConn, tlsConfig)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("TLS handshake: %w", err)
+	}
+
+	// Perform knock
+	knock := b.transport.GenerateKnock()
+	knockReq := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\n", knock.Path, b.transport.ServerName())
+	for key, value := range knock.Headers {
+		knockReq += fmt.Sprintf("%s: %s\r\n", key, value)
+	}
+	knockReq += fmt.Sprintf("Content-Length: %d\r\n\r\n%s", len(knock.Body), knock.Body)
+
+	if _, err := tlsConn.Write([]byte(knockReq)); err != nil {
+		tlsConn.Close()
+		return nil, fmt.Errorf("send knock: %w", err)
+	}
+
+	// Read knock response
+	buf := make([]byte, 1024)
+	n, err := tlsConn.Read(buf)
+	if err != nil {
+		tlsConn.Close()
+		return nil, fmt.Errorf("read knock response: %w", err)
+	}
+	// Accept both 200 OK (legacy) and 101 Switching Protocols (WebSocket upgrade)
+	if n < 12 || (string(buf[9:12]) != "200" && string(buf[9:12]) != "101") {
+		tlsConn.Close()
+		return nil, fmt.Errorf("knock failed: %s", string(buf[:n]))
+	}
+
+	// Wrap in WebSocket framing for DPI resistance.
+	// Post-knock traffic now looks like WebSocket binary frames.
+	return newWSConn(tlsConn), nil
 }
 
 // ParseEndpoint implements conn.Bind
@@ -206,10 +472,12 @@ func (b *HTTPSBind) BatchSize() int {
 }
 
 func (b *HTTPSBind) receiveLoop(ep *httpsEndpoint) {
+	// Receive loop for connection
 	buf := make([]byte, 65536)
 	for {
 		n, err := ep.conn.Read(buf)
 		if err != nil {
+			// Connection closed or error
 			b.connsMu.Lock()
 			delete(b.remoteConns, ep.addr)
 			b.connsMu.Unlock()
@@ -218,6 +486,15 @@ func (b *HTTPSBind) receiveLoop(ep *httpsEndpoint) {
 
 		data := make([]byte, n)
 		copy(data, buf[:n])
+
+		b.closeMu.Lock()
+		closed := b.closed
+		b.closeMu.Unlock()
+		if closed {
+			return
+		}
+
+		// Received packet
 
 		select {
 		case b.recvChan <- recvPacket{data: data, endpoint: ep}:
@@ -385,7 +662,9 @@ type HTTPSListener struct {
 	bind      *HTTPSBind
 }
 
-// StartHTTPSListener starts listening for incoming HTTPS connections
+// StartHTTPSListener starts listening for incoming HTTPS connections.
+// Incoming connections go through knock validation, then authenticated
+// connections are fed into the WireGuard receive channel.
 func (b *HTTPSBind) StartListener(addr string, tlsConfig *tls.Config) error {
 	ln, err := tls.Listen("tcp", addr, tlsConfig)
 	if err != nil {
@@ -398,8 +677,6 @@ func (b *HTTPSBind) StartListener(addr string, tlsConfig *tls.Config) error {
 			if err != nil {
 				return
 			}
-
-			// Handle incoming connection
 			go b.handleIncoming(conn)
 		}
 	}()
@@ -408,12 +685,49 @@ func (b *HTTPSBind) StartListener(addr string, tlsConfig *tls.Config) error {
 }
 
 func (b *HTTPSBind) handleIncoming(c net.Conn) {
-	// Wrap connection with HTTP handling for knock auth
-	// This is simplified - full implementation would do HTTP parsing
+	// Read the full knock HTTP request using buffered reads.
+	// A single Read may not return the complete HTTP request on slow/fragmented connections.
+	c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	var buf []byte
+	tmp := make([]byte, 4096)
+	for {
+		n, err := c.Read(tmp)
+		if err != nil {
+			c.Close()
+			return
+		}
+		buf = append(buf, tmp[:n]...)
+		// HTTP request ends with \r\n\r\n
+		if bytes.Contains(buf, []byte("\r\n\r\n")) || len(buf) > 8192 {
+			break
+		}
+	}
+	c.SetReadDeadline(time.Time{})
+
+	// Validate knock using the transport's knock validator
+	peerKey := b.transport.ValidateKnock(buf)
+	if peerKey == nil {
+		// Not a valid knock — serve cover response and close
+		cover := "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 44\r\n\r\n<html><body>Nothing to see here.</body></html>"
+		c.Write([]byte(cover))
+		c.Close()
+		return
+	}
+
+	// Valid knock — send WebSocket upgrade response (looks like a real WS handshake)
+	wsResponse := "HTTP/1.1 101 Switching Protocols\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Accept: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+	c.Write([]byte(wsResponse))
+
+	// Wrap in WebSocket framing — read the client's length mask first
+	wsConn := newWSConnServer(c)
 
 	remoteAddr := c.RemoteAddr().String()
+
 	ep := &httpsEndpoint{
-		conn: c,
+		conn: wsConn,
 		addr: remoteAddr,
 	}
 
@@ -421,7 +735,6 @@ func (b *HTTPSBind) handleIncoming(c net.Conn) {
 	b.remoteConns[remoteAddr] = ep
 	b.connsMu.Unlock()
 
-	// Start receive loop
 	b.receiveLoop(ep)
 }
 

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -46,6 +47,7 @@ func (t Type) String() string {
 
 // Canary represents a canary token
 type Canary struct {
+	mu              sync.Mutex
 	ID              [CanaryIDLength]byte
 	Type            Type
 	NodeID          string
@@ -136,12 +138,16 @@ func (c *Canary) ShortID() string {
 
 // CheckIn records a check-in for dead switch canaries
 func (c *Canary) CheckIn() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.LastCheckIn = time.Now()
 	c.MissedCount = 0
 }
 
 // IsDue returns true if a check-in is overdue
 func (c *Canary) IsDue() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.Type != TypeDeadSwitch {
 		return false
 	}
@@ -150,16 +156,27 @@ func (c *Canary) IsDue() bool {
 
 // RecordMiss increments the missed count and returns true if threshold exceeded
 func (c *Canary) RecordMiss() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.MissedCount++
 	return c.MissedCount >= c.Threshold
 }
 
 // Trigger marks the canary as triggered
 func (c *Canary) Trigger() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if !c.Triggered {
 		c.Triggered = true
 		c.TriggeredAt = time.Now()
 	}
+}
+
+// IsTriggered returns whether the canary has been triggered
+func (c *Canary) IsTriggered() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.Triggered
 }
 
 // Hash returns a hash of the canary for safe logging

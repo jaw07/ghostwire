@@ -2,6 +2,9 @@ package cli
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/asn1"
@@ -10,6 +13,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"net"
 	"io"
 	"net/http"
 	"os"
@@ -102,6 +106,8 @@ func joinMesh(tokenStr, endpoint, nodeName, configDir string) error {
 		SuggestedName: payload.SuggestedName,
 		MaxUses:       int(payload.MaxUses),
 		MeshID:        payload.MeshID,
+		NotBefore:     time.Unix(payload.NotBefore, 0),
+		NotAfter:      time.Unix(payload.NotAfter, 0),
 	}
 
 	// Check token expiry (basic validation without full signature check)
@@ -211,11 +217,17 @@ func joinMesh(tokenStr, endpoint, nodeName, configDir string) error {
 	fmt.Printf("  Peers:       %d\n", len(enrollResp.Peers))
 	fmt.Println()
 
-	// Verify certificate chain
-	fmt.Println("Verifying certificate...")
+	// Verify the CA certificate matches the mesh ID from the enrollment token.
+	// The mesh ID is SHA-256(CA public key), so this pins the CA identity
+	// and prevents MITM attacks that substitute a rogue CA.
+	fmt.Println("Verifying certificate chain and CA identity...")
 	if err := verifyCertificate(enrollResp.Certificate, enrollResp.CACertificate); err != nil {
 		return fmt.Errorf("certificate verification failed: %w", err)
 	}
+	if err := verifyCAFingerprint(enrollResp.CACertificate, tok.MeshID); err != nil {
+		return fmt.Errorf("CA identity verification failed (possible MITM): %w", err)
+	}
+	fmt.Println("  CA identity verified against enrollment token")
 
 	// Build and save config
 	fmt.Println("Saving configuration...")
@@ -223,6 +235,44 @@ func joinMesh(tokenStr, endpoint, nodeName, configDir string) error {
 	privateKeyPEM, err := pki.PrivateKeyToPEM(nodeKp.Ed25519PrivateKey)
 	if err != nil {
 		return fmt.Errorf("encode private key: %w", err)
+	}
+
+	// Fix peer endpoints: for the admin peer (the one we just enrolled through),
+	// replace 0.0.0.0 with the admin's actual reachable IP.
+	// For other peers, clear 0.0.0.0 endpoints — they'll be discovered via gossip.
+	adminHost, _, _ := net.SplitHostPort(endpoint)
+	for i := range enrollResp.Peers {
+		isAdmin := false
+		for _, role := range enrollResp.Peers[i].Roles {
+			if role == "admin" {
+				isAdmin = true
+				break
+			}
+		}
+
+		if isAdmin {
+			// Replace empty/0.0.0.0 hosts with the admin's actual IP
+			for j := range enrollResp.Peers[i].Endpoints {
+				ep := enrollResp.Peers[i].Endpoints[j]
+				h, p, err := net.SplitHostPort(ep)
+				if err == nil && (h == "" || h == "0.0.0.0" || h == "::") {
+					enrollResp.Peers[i].Endpoints[j] = net.JoinHostPort(adminHost, p)
+				}
+			}
+			if len(enrollResp.Peers[i].Endpoints) == 0 {
+				enrollResp.Peers[i].Endpoints = []string{net.JoinHostPort(adminHost, "8444")}
+			}
+		} else {
+			// Non-admin peers: remove 0.0.0.0 endpoints, they'll be discovered via gossip
+			var validEps []string
+			for _, ep := range enrollResp.Peers[i].Endpoints {
+				h, _, err := net.SplitHostPort(ep)
+				if err == nil && h != "0.0.0.0" && h != "::" {
+					validEps = append(validEps, ep)
+				}
+			}
+			enrollResp.Peers[i].Endpoints = validEps
+		}
 	}
 
 	meshConfig := &config.MeshConfig{
@@ -267,6 +317,32 @@ func joinMesh(tokenStr, endpoint, nodeName, configDir string) error {
 	fmt.Println()
 	fmt.Println("Next steps:")
 	fmt.Println("  Run 'ghostwire up' to start the daemon and connect to the mesh")
+
+	return nil
+}
+
+// verifyCAFingerprint checks that the CA certificate's public key hash matches
+// the mesh ID from the enrollment token. This prevents MITM attacks where an
+// attacker substitutes their own CA during enrollment.
+func verifyCAFingerprint(caPEM string, expectedMeshID [32]byte) error {
+	block, _ := pem.Decode([]byte(caPEM))
+	if block == nil {
+		return fmt.Errorf("invalid CA certificate PEM")
+	}
+	caCert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("parse CA certificate: %w", err)
+	}
+
+	edPub, ok := caCert.PublicKey.(ed25519.PublicKey)
+	if !ok {
+		return fmt.Errorf("CA certificate does not use Ed25519 key")
+	}
+
+	actualMeshID := sha256.Sum256(edPub)
+	if subtle.ConstantTimeCompare(actualMeshID[:], expectedMeshID[:]) != 1 {
+		return fmt.Errorf("CA public key fingerprint does not match enrollment token mesh ID")
+	}
 
 	return nil
 }

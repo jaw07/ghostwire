@@ -83,8 +83,11 @@ type HTTPSTransportConfig struct {
 	// Browser fingerprint profile: "chrome", "firefox", "safari", "auto"
 	Fingerprint string `yaml:"fingerprint"`
 
-	// Listen address for server mode
+	// Listen address for enrollment/API server mode
 	ListenAddr string `yaml:"listen_addr,omitempty"`
+
+	// Listen address for WireGuard transport connections (separate from enrollment)
+	TransportListenAddr string `yaml:"transport_listen_addr,omitempty"`
 }
 
 // QUICTransportConfig configures the QUIC transport

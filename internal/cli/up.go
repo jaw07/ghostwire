@@ -10,9 +10,12 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"net"
+	"strings"
 	"net/netip"
 	"os"
 	"os/signal"
@@ -24,6 +27,7 @@ import (
 
 	"github.com/ghostwire/ghostwire/internal/api"
 	"github.com/ghostwire/ghostwire/internal/config"
+	"github.com/ghostwire/ghostwire/internal/gui"
 	"github.com/ghostwire/ghostwire/internal/daemon"
 	"github.com/ghostwire/ghostwire/internal/gossip"
 	"github.com/ghostwire/ghostwire/internal/keys"
@@ -104,6 +108,9 @@ func startDaemon(configDir string, foreground bool) error {
 		fmt.Println("Loading admin configuration...")
 		adminConfig, err = loader.LoadAdminConfig(passphrase)
 		if err != nil {
+			if strings.Contains(err.Error(), "passphrase") || strings.Contains(err.Error(), "identity") || strings.Contains(err.Error(), "decrypt") {
+				return fmt.Errorf("incorrect passphrase for admin config at %s", loader.AdminConfigPath())
+			}
 			return fmt.Errorf("load admin config: %w", err)
 		}
 		meshConfig = &adminConfig.MeshConfig
@@ -112,6 +119,9 @@ func startDaemon(configDir string, foreground bool) error {
 		fmt.Println("Loading node configuration...")
 		meshConfig, err = loader.LoadConfig(passphrase)
 		if err != nil {
+			if strings.Contains(err.Error(), "passphrase") || strings.Contains(err.Error(), "identity") || strings.Contains(err.Error(), "decrypt") {
+				return fmt.Errorf("incorrect passphrase for config at %s\nIf the config is from a previous mesh, run 'ghostwire panic --wipe-config --force' first", loader.ConfigPath())
+			}
 			return fmt.Errorf("load config: %w", err)
 		}
 	}
@@ -160,14 +170,17 @@ func startDaemon(configDir string, foreground bool) error {
 	}
 	defer keys.WipeBytes(privateKey)
 
-	// Convert Ed25519 seed to X25519 for WireGuard
-	var wgPrivateKey [32]byte
-	copy(wgPrivateKey[:], privateKey[:32])
+	// Convert Ed25519 seed to X25519 for WireGuard (proper SHA-512 + clamping)
+	wgPrivateKey, _, err := keys.Ed25519SeedToX25519(privateKey[:32])
+	if err != nil {
+		return fmt.Errorf("convert Ed25519 to X25519: %w", err)
+	}
+	defer keys.WipeBytes(wgPrivateKey[:])
 
 	// Decode mesh secret for transport authentication
 	var meshSecret []byte
 	if meshConfig.MeshSecret != "" {
-		meshSecret, err = base64.StdEncoding.DecodeString(meshConfig.MeshSecret)
+		meshSecret, err = hex.DecodeString(meshConfig.MeshSecret)
 		if err != nil {
 			return fmt.Errorf("decode mesh secret: %w", err)
 		}
@@ -199,15 +212,48 @@ func startDaemon(configDir string, foreground bool) error {
 	fmt.Printf("  Subnet:      %s\n", meshConfig.MeshSubnet)
 	fmt.Println()
 
-	// Add configured peers
+	// Start HTTPS transport listener for incoming tunnel connections.
+	// Uses a separate port from the enrollment server to avoid conflicts.
+	if meshConfig.Transport.Active == "https-mimic" || meshConfig.Transport.Active == "https" || meshConfig.Transport.Active == "hybrid" {
+		transportListenAddr := meshConfig.Transport.HTTPS.TransportListenAddr
+		if transportListenAddr == "" {
+			// Default: enrollment server port + 1, or :8444
+			transportListenAddr = ":8444"
+		}
+
+		transportTLSCert, err := generateTLSCert(meshConfig.Transport.HTTPS.ServerName)
+		if err != nil {
+			fmt.Printf("Warning: could not generate transport TLS cert: %v\n", err)
+		} else {
+			transportTLS := &tls.Config{
+				Certificates: []tls.Certificate{transportTLSCert},
+				MinVersion:   tls.VersionTLS13,
+			}
+			if err := dev.StartTransportListener(transportListenAddr, transportTLS); err != nil {
+				fmt.Printf("Warning: could not start transport listener: %v\n", err)
+			} else {
+				fmt.Printf("  Transport listener started on %s\n", transportListenAddr)
+			}
+		}
+	}
+
+	// Add configured peers that have valid endpoints.
+	// Peers without endpoints will be discovered and added via gossip.
 	if len(meshConfig.Peers) > 0 {
-		fmt.Printf("Adding %d peer(s)...\n", len(meshConfig.Peers))
+		added := 0
 		for _, peerCfg := range meshConfig.Peers {
+			if len(peerCfg.Endpoints) == 0 {
+				continue // Will be added via gossip discovery
+			}
 			if err := addPeerFromConfig(dev, &peerCfg); err != nil {
 				fmt.Printf("  Warning: failed to add peer %s: %v\n", peerCfg.NodeID, err)
 			} else {
-				fmt.Printf("  Added peer: %s\n", peerCfg.NodeID)
+				fmt.Printf("  Added peer: %s (%s)\n", peerCfg.NodeID, peerCfg.Endpoints[0])
+				added++
 			}
+		}
+		if added > 0 {
+			fmt.Printf("Added %d peer(s) from config, remaining peers via gossip\n", added)
 		}
 		fmt.Println()
 	}
@@ -218,11 +264,17 @@ func startDaemon(configDir string, foreground bool) error {
 	// Parse mesh IP for gossip
 	meshIP, _ := netip.ParseAddr(meshConfig.AssignedIP)
 
-	// Create gossip member for self
+	// Determine the host's reachable IP for gossip.
+	// Gossip probes must use an IP that's routable on the underlay network
+	// (not the mesh overlay IP, which requires a working tunnel).
+	gossipPort := "7946"
+	gossipAdvertiseIP := detectOutboundIP()
+	selfGossipAddr := gossipAdvertiseIP + ":" + gossipPort
+
 	selfMember := &gossip.Member{
 		NodeID:    meshConfig.NodeID,
 		MeshIP:    meshIP,
-		Endpoints: []string{meshConfig.Transport.HTTPS.ListenAddr},
+		Endpoints: []string{selfGossipAddr},
 		Roles:     meshConfig.Roles,
 		PublicKey: pubKeyB64,
 		State:     gossip.StateAlive,
@@ -231,12 +283,16 @@ func startDaemon(configDir string, foreground bool) error {
 
 	// Initialize gossip protocol
 	gossipCfg := &gossip.Config{
-		BindAddr:       ":7946",
+		BindAddr:       ":" + gossipPort,
 		GossipInterval: 1 * time.Second,
-		ProbeInterval:  500 * time.Millisecond,
-		ProbeTimeout:   500 * time.Millisecond,
-		MeshSecret:     meshSecret,
+		ProbeInterval:    2 * time.Second,
+		ProbeTimeout:    3 * time.Second,
+		SuspicionTimeout: 15 * time.Second,
+		IndirectChecks:  3,
+		MeshSecret:      meshSecret,
 	}
+
+	fmt.Printf("  Self gossip endpoint: %s\n", selfGossipAddr)
 
 	gossipService, err := gossip.New(gossipCfg, selfMember)
 	if err != nil {
@@ -251,27 +307,97 @@ func startDaemon(configDir string, foreground bool) error {
 	}
 	defer gossipService.Stop()
 
+	// Create GUI server early so gossip callbacks can reference it
+	fmt.Println("Starting GUI server...")
+	guiCfg := &gui.Config{
+		ListenAddr: "0.0.0.0:9999",
+		AutoOpen:   false,
+	}
+	guiServer, guiErr := gui.New(guiCfg)
+	if guiErr != nil {
+		fmt.Printf("Warning: could not create GUI server: %v\n", guiErr)
+	}
+
+	// Helper to push current gossip member list to GUI
+	updateGUIPeers := func() {
+		if guiServer == nil {
+			return
+		}
+		members := gossipService.Members().AliveMembers()
+		var guiPeers []*gui.Peer
+		for _, m := range members {
+			ep := ""
+			if len(m.Endpoints) > 0 {
+				ep = m.Endpoints[0]
+			}
+			guiPeers = append(guiPeers, &gui.Peer{
+				NodeID:    m.NodeID,
+				MeshIP:    m.MeshIP.String(),
+				Endpoint:  ep,
+				Roles:     m.Roles,
+				Connected: m.State == gossip.StateAlive,
+				Latency:   m.RTT.Milliseconds(),
+			})
+		}
+		guiServer.SetPeers(guiPeers)
+	}
+
 	// Initialize routing table
 	routeTable := routing.NewTable(meshConfig.NodeID, meshIP)
 	routeTable.SetOnChange(func(nodeID string, routes []*routing.Route) {
-		// When routes change, update WireGuard peers
 		if len(routes) > 0 {
 			fmt.Printf("  Route update: %s via %s\n", nodeID, routes[0].Type)
 		}
 	})
 
-	// Set up gossip callbacks to update routing
+	// Set up gossip callbacks to update routing + GUI + knock validator + WG peers
 	gossipService.Members().SetCallbacks(
 		func(m *gossip.Member) {
 			fmt.Printf("  Peer joined: %s (%s)\n", m.NodeID, m.MeshIP)
 			routeTable.UpdateFromGossip(gossipService.Members())
+			updateGUIPeers()
+			// Register the new peer's WG public key for knock auth + WireGuard
+			if m.PublicKey != "" && m.NodeID != meshConfig.NodeID {
+				if keyBytes, err := base64.StdEncoding.DecodeString(m.PublicKey); err == nil {
+					dev.RegisterKnockPeer(keyBytes)
+					// Also add as a WireGuard peer if not already known
+					if _, exists := dev.GetPeer(m.NodeID); !exists {
+						var pubKey [32]byte
+						copy(pubKey[:], keyBytes)
+						ep := ""
+						if len(m.Endpoints) > 0 {
+							ep = m.Endpoints[0]
+							// Use transport port, not gossip port
+							h, _, splitErr := net.SplitHostPort(ep)
+							if splitErr == nil {
+								ep = net.JoinHostPort(h, "8444")
+							}
+						}
+						peer := tunnel.NewPeer(&tunnel.PeerConfig{
+							NodeID:              m.NodeID,
+							PublicKey:           pubKey,
+							MeshIP:              m.MeshIP,
+							Endpoints:           []string{ep},
+							PersistentKeepalive: 25,
+							Roles:               m.Roles,
+						})
+						if err := dev.AddPeer(peer); err != nil {
+							fmt.Printf("  Warning: could not add peer %s to WireGuard: %v\n", m.NodeID, err)
+						} else {
+							fmt.Printf("  Added WireGuard peer: %s (%s)\n", m.NodeID, m.MeshIP)
+						}
+					}
+				}
+			}
 		},
 		func(m *gossip.Member) {
 			fmt.Printf("  Peer left: %s\n", m.NodeID)
 			routeTable.UpdateFromGossip(gossipService.Members())
+			updateGUIPeers()
 		},
 		func(m *gossip.Member) {
 			routeTable.UpdateFromGossip(gossipService.Members())
+			updateGUIPeers()
 		},
 	)
 
@@ -351,21 +477,44 @@ func startDaemon(configDir string, foreground bool) error {
 		}
 	}
 
-	// Join gossip with configured peers
+	// Join gossip with configured peers.
+	// Gossip endpoints use the peer's underlay IP (from their transport endpoint)
+	// with the gossip port, since the mesh overlay isn't up yet.
 	if len(meshConfig.Peers) > 0 {
 		var gossipPeers []*gossip.Member
 		for _, peerCfg := range meshConfig.Peers {
 			peerIP, _ := netip.ParseAddr(peerCfg.MeshIP)
+
+			// Extract the peer's reachable underlay IP from their transport endpoints
+			var gossipEndpoints []string
+			for _, ep := range peerCfg.Endpoints {
+				host, _, err := net.SplitHostPort(ep)
+				if err != nil {
+					host = ep
+				}
+				if host != "" && host != "0.0.0.0" && host != "::" {
+					gossipEndpoints = append(gossipEndpoints, net.JoinHostPort(host, gossipPort))
+				}
+			}
+			// Skip peers with no reachable underlay endpoints — they'll be
+			// discovered via gossip sync from other nodes
+			if len(gossipEndpoints) == 0 {
+				continue
+			}
+
 			gossipPeers = append(gossipPeers, &gossip.Member{
 				NodeID:    peerCfg.NodeID,
 				MeshIP:    peerIP,
-				Endpoints: peerCfg.Endpoints,
+				Endpoints: gossipEndpoints,
 				Roles:     peerCfg.Roles,
 				PublicKey: peerCfg.PublicKey,
 				State:     gossip.StateAlive,
 			})
 		}
 		gossipService.Join(gossipPeers)
+		for _, gp := range gossipPeers {
+			fmt.Printf("  Gossip peer: %s endpoints=%v\n", gp.NodeID, gp.Endpoints)
+		}
 		fmt.Printf("  Joined gossip with %d peers\n", len(gossipPeers))
 	}
 
@@ -387,7 +536,7 @@ func startDaemon(configDir string, foreground bool) error {
 		}
 
 		// Decode mesh secret
-		meshSecret, err := base64.StdEncoding.DecodeString(adminConfig.MeshSecret)
+		meshSecret, err := hex.DecodeString(adminConfig.MeshSecret)
 		if err != nil {
 			return fmt.Errorf("decode mesh secret: %w", err)
 		}
@@ -434,6 +583,53 @@ func startDaemon(configDir string, foreground bool) error {
 		fmt.Println()
 	}
 
+	// Start GUI server (created earlier, before gossip callbacks)
+	if guiServer != nil {
+		startTime := time.Now()
+
+		// Set initial status
+		guiServer.SetStatus(&gui.Status{
+			Connected: true,
+			NodeID:    meshConfig.NodeID,
+			MeshName:  meshConfig.MeshName,
+			MeshIP:    meshConfig.AssignedIP,
+			Transport: meshConfig.Transport.Active,
+			PeerCount: len(meshConfig.Peers),
+		})
+
+		// Set initial peers from config
+		updateGUIPeers()
+
+		go func() {
+			if err := guiServer.Start(); err != nil {
+				fmt.Printf("GUI server error: %v\n", err)
+			}
+		}()
+
+		// Periodic status + peer refresh
+		go func() {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				members := gossipService.Members().AliveMembers()
+				guiServer.SetStatus(&gui.Status{
+					Connected: true,
+					NodeID:    meshConfig.NodeID,
+					MeshName:  meshConfig.MeshName,
+					MeshIP:    meshConfig.AssignedIP,
+					Transport: meshConfig.Transport.Active,
+					PeerCount: len(members),
+					Uptime:    int64(time.Since(startTime).Seconds()),
+				})
+				updateGUIPeers()
+			}
+		}()
+
+		fmt.Printf("  GUI available at: %s\n", guiServer.URL())
+		fmt.Println()
+		defer guiServer.Stop(context.Background())
+	}
+
 	// Write PID file
 	if err := daemonMgr.WritePID(); err != nil {
 		fmt.Printf("Warning: could not write PID file: %v\n", err)
@@ -475,8 +671,14 @@ func startDaemon(configDir string, foreground bool) error {
 	return nil
 }
 
-// generateTLSCert generates a self-signed TLS certificate
+// generateTLSCert generates a self-signed TLS certificate (fallback when no CA available)
 func generateTLSCert(serverName string) (tls.Certificate, error) {
+	return generateTLSCertWithCA(serverName, nil, nil)
+}
+
+// generateTLSCertWithCA generates a TLS certificate signed by the mesh CA.
+// If caCert/caKey are nil, falls back to self-signing.
+func generateTLSCertWithCA(serverName string, caCert *x509.Certificate, caKey interface{}) (tls.Certificate, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return tls.Certificate{}, err
@@ -495,15 +697,32 @@ func generateTLSCert(serverName string) (tls.Certificate, error) {
 		NotBefore:             time.Now(),
 		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
 	}
 
 	if serverName != "" {
-		template.DNSNames = []string{serverName}
+		template.DNSNames = []string{serverName, "localhost"}
+	}
+	// Add common Docker/local IPs as SANs so cert validates regardless of how peer connects
+	template.IPAddresses = []net.IP{
+		net.ParseIP("127.0.0.1"),
+		net.ParseIP("0.0.0.0"),
+	}
+	// Add the host's detected outbound IP
+	if hostIP := net.ParseIP(detectOutboundIP()); hostIP != nil {
+		template.IPAddresses = append(template.IPAddresses, hostIP)
 	}
 
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	// Sign with CA if available, otherwise self-sign
+	issuer := &template
+	signingKey := interface{}(priv)
+	if caCert != nil && caKey != nil {
+		issuer = caCert
+		signingKey = caKey
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, issuer, &priv.PublicKey, signingKey)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
@@ -515,7 +734,17 @@ func generateTLSCert(serverName string) (tls.Certificate, error) {
 	}
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 
-	return tls.X509KeyPair(certPEM, keyPEM)
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	// If CA-signed, include the CA cert in the chain so peers can verify
+	if caCert != nil {
+		tlsCert.Certificate = append(tlsCert.Certificate, caCert.Raw)
+	}
+
+	return tlsCert, nil
 }
 
 // parsePrivateKey extracts the private key bytes from PEM format
@@ -539,6 +768,18 @@ func parsePrivateKey(pemData string) ([]byte, error) {
 	}
 }
 
+// detectOutboundIP finds this host's preferred outbound IP by dialing a
+// dummy UDP address and checking the local address chosen by the OS.
+func detectOutboundIP() string {
+	conn, err := net.Dial("udp4", "8.8.8.8:53")
+	if err != nil {
+		return "127.0.0.1"
+	}
+	defer conn.Close()
+	addr := conn.LocalAddr().(*net.UDPAddr)
+	return addr.IP.String()
+}
+
 // addPeerFromConfig adds a peer from the config
 func addPeerFromConfig(dev *tunnel.Device, peerCfg *config.PeerConfig) error {
 	// Decode public key from base64
@@ -558,6 +799,9 @@ func addPeerFromConfig(dev *tunnel.Device, peerCfg *config.PeerConfig) error {
 	if err != nil {
 		return fmt.Errorf("parse peer mesh IP: %w", err)
 	}
+
+	// Register the peer's public key for knock authentication
+	dev.RegisterKnockPeer(pubKeyBytes)
 
 	peer := tunnel.NewPeer(&tunnel.PeerConfig{
 		NodeID:              peerCfg.NodeID,

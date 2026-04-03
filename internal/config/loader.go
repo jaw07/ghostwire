@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -161,7 +163,9 @@ func (l *Loader) AdminConfigExists() bool {
 	return err == nil
 }
 
-// SecureDelete securely deletes a file by overwriting with zeros before deletion
+// SecureDelete securely deletes a file by overwriting before deletion.
+// Note: On copy-on-write filesystems (APFS, Btrfs), the original data blocks
+// may be retained in journal or snapshot history. This is a best-effort wipe.
 func SecureDelete(path string) error {
 	info, err := os.Stat(path)
 	if os.IsNotExist(err) {
@@ -171,21 +175,39 @@ func SecureDelete(path string) error {
 		return err
 	}
 
+	size := info.Size()
+	buf := make([]byte, 4096)
+
 	// Open file for writing
 	f, err := os.OpenFile(path, os.O_WRONLY, 0)
 	if err != nil {
 		return err
 	}
 
-	// Overwrite with zeros
-	zeros := make([]byte, 4096)
-	size := info.Size()
+	// Pass 1: Overwrite with random bytes
 	for written := int64(0); written < size; {
 		n := size - written
-		if n > int64(len(zeros)) {
-			n = int64(len(zeros))
+		if n > int64(len(buf)) {
+			n = int64(len(buf))
 		}
-		if _, err := f.Write(zeros[:n]); err != nil {
+		rand.Read(buf[:n])
+		if _, err := f.Write(buf[:n]); err != nil {
+			f.Close()
+			return err
+		}
+		written += n
+	}
+	f.Sync()
+
+	// Pass 2: Overwrite with zeros
+	f.Seek(0, 0)
+	keys.WipeBytes(buf) // Zero the buffer
+	for written := int64(0); written < size; {
+		n := size - written
+		if n > int64(len(buf)) {
+			n = int64(len(buf))
+		}
+		if _, err := f.Write(buf[:n]); err != nil {
 			f.Close()
 			return err
 		}
@@ -197,11 +219,19 @@ func SecureDelete(path string) error {
 		f.Close()
 		return err
 	}
-
 	f.Close()
 
-	// Delete the file
-	return os.Remove(path)
+	// Rename to random name before deletion to prevent directory entry recovery
+	dir := filepath.Dir(path)
+	var randomName [8]byte
+	rand.Read(randomName[:])
+	tmpPath := filepath.Join(dir, "."+hex.EncodeToString(randomName[:])+".tmp")
+	if err := os.Rename(path, tmpPath); err != nil {
+		// Rename failed, fall back to removing original path
+		return os.Remove(path)
+	}
+
+	return os.Remove(tmpPath)
 }
 
 // WipeConfig securely deletes the config file

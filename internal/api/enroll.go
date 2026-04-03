@@ -84,9 +84,16 @@ func NewEnrollmentServer(cfg *ServerConfig) (*EnrollmentServer, error) {
 	mux.HandleFunc("/enroll", s.handleEnroll)
 	mux.HandleFunc("/health", s.handleHealth)
 
+	// TLS 1.3 required. Client certificates are not required for enrollment
+	// since new nodes don't have certificates yet (enrollment is how they get one).
+	// The enrollment token serves as the authorization gate. The mesh_secret is
+	// transmitted over this TLS channel — this is acceptable because:
+	// 1. Tokens are one-time use and time-limited
+	// 2. TLS 1.3 provides forward secrecy
+	// 3. The enrollment endpoint should only be exposed during node provisioning
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cfg.TLSCert},
-		MinVersion:   tls.VersionTLS12,
+		MinVersion:   tls.VersionTLS13,
 	}
 
 	s.server = &http.Server{
@@ -155,8 +162,22 @@ func (s *EnrollmentServer) handleEnroll(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Check and update token usage
+	// Decode public keys before taking the lock
+	pubKeyBytes, err := base64.StdEncoding.DecodeString(req.PublicKey)
+	if err != nil || len(pubKeyBytes) != ed25519.PublicKeySize {
+		s.writeError(w, http.StatusBadRequest, "invalid_public_key", "Invalid Ed25519 public key")
+		return
+	}
+
+	wgPubKeyBytes, err := base64.StdEncoding.DecodeString(req.WGPubKey)
+	if err != nil || len(wgPubKeyBytes) != 32 {
+		s.writeError(w, http.StatusBadRequest, "invalid_wg_key", "Invalid WireGuard public key")
+		return
+	}
+
+	// Check and update token usage under lock
 	s.configMu.Lock()
+
 	tokenUsed := false
 	for i := range s.adminConfig.EnrollmentTokens {
 		if s.adminConfig.EnrollmentTokens[i].TokenID == hex.EncodeToString(tok.ID[:]) {
@@ -174,21 +195,6 @@ func (s *EnrollmentServer) handleEnroll(w http.ResponseWriter, r *http.Request) 
 	if !tokenUsed {
 		s.configMu.Unlock()
 		s.writeError(w, http.StatusUnauthorized, "token_not_found", "Token not found in admin config")
-		return
-	}
-
-	// Decode public keys
-	pubKeyBytes, err := base64.StdEncoding.DecodeString(req.PublicKey)
-	if err != nil || len(pubKeyBytes) != ed25519.PublicKeySize {
-		s.configMu.Unlock()
-		s.writeError(w, http.StatusBadRequest, "invalid_public_key", "Invalid Ed25519 public key")
-		return
-	}
-
-	wgPubKeyBytes, err := base64.StdEncoding.DecodeString(req.WGPubKey)
-	if err != nil || len(wgPubKeyBytes) != 32 {
-		s.configMu.Unlock()
-		s.writeError(w, http.StatusBadRequest, "invalid_wg_key", "Invalid WireGuard public key")
 		return
 	}
 
@@ -244,14 +250,16 @@ func (s *EnrollmentServer) handleEnroll(w http.ResponseWriter, r *http.Request) 
 	// Build peer list for the new node (include admin and other peers)
 	peers := s.buildPeerList(nodeName)
 
-	// Save updated admin config
+	// Copy config ref for saving outside the lock
+	adminConfigCopy := s.adminConfig
+	s.configMu.Unlock()
+
+	// Save updated admin config outside of the lock to avoid holding it during slow I/O
 	if s.saveConfig != nil {
-		if err := s.saveConfig(s.adminConfig); err != nil {
-			// Log but don't fail the enrollment
+		if err := s.saveConfig(adminConfigCopy); err != nil {
 			fmt.Printf("Warning: failed to save admin config: %v\n", err)
 		}
 	}
-	s.configMu.Unlock()
 
 	// Build response
 	resp := &EnrollmentResponse{
@@ -353,7 +361,12 @@ func (s *EnrollmentServer) getAdminWGPubKey() string {
 }
 
 func (s *EnrollmentServer) getAdminEndpoints() []string {
-	// Get admin's listen address as endpoint
+	// Return the transport listener address (for WireGuard tunnel connections),
+	// not the enrollment server address
+	if s.adminConfig.Transport.HTTPS.TransportListenAddr != "" {
+		return []string{s.adminConfig.Transport.HTTPS.TransportListenAddr}
+	}
+	// Fall back to enrollment listen addr if transport addr not configured
 	if s.adminConfig.Transport.HTTPS.ListenAddr != "" {
 		return []string{s.adminConfig.Transport.HTTPS.ListenAddr}
 	}

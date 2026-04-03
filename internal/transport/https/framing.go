@@ -85,13 +85,13 @@ func UnmarshalFrame(r io.Reader) (*TunnelFrame, error) {
 	}
 
 	// Calculate total frame size including padding
-	paddedLen := payloadLen
+	readLen := int(payloadLen)
 	if flags&FlagPadded != 0 {
-		paddedLen = uint16(findNextPaddingSize(int(payloadLen)))
+		readLen = findNextPaddingSize(int(payloadLen))
 	}
 
 	// Read the full padded payload
-	buf := make([]byte, paddedLen)
+	buf := make([]byte, readLen)
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return nil, err
 	}

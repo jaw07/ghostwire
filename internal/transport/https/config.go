@@ -44,6 +44,10 @@ type Config struct {
 	// Local node's WireGuard public key
 	LocalPublicKey []byte
 
+	// CACertPEM is the mesh CA certificate in PEM format.
+	// If set, the transport trusts this CA for peer TLS connections.
+	CACertPEM []byte
+
 	// Knock authentication window
 	KnockWindow time.Duration
 

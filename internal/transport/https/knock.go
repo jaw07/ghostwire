@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/hkdf"
@@ -55,7 +56,11 @@ type KnockSequence struct {
 // Generate creates a knock sequence for the given public key
 func (kg *KnockGenerator) Generate(clientPubKey []byte) *KnockSequence {
 	timestamp := time.Now().Unix()
-	window := timestamp / int64(kg.window.Seconds())
+	windowSecs := int64(kg.window.Seconds())
+	if windowSecs <= 0 {
+		windowSecs = 30 // fallback
+	}
+	window := timestamp / windowSecs
 
 	// Derive knock material using HKDF
 	knockMaterial := kg.deriveKnockMaterial(clientPubKey, window)
@@ -115,6 +120,8 @@ type KnockValidator struct {
 	window       time.Duration
 	clockSkew    time.Duration
 	knownClients map[string][]byte // pubKeyHex -> pubKey
+	seenKnocks   map[string]int64  // knockHex -> expiry unix timestamp
+	seenMu       sync.Mutex
 }
 
 // NewKnockValidator creates a new knock validator
@@ -124,6 +131,7 @@ func NewKnockValidator(meshSecret []byte, window time.Duration) *KnockValidator 
 		window:       window,
 		clockSkew:    60 * time.Second,
 		knownClients: make(map[string][]byte),
+		seenKnocks:   make(map[string]int64),
 	}
 }
 
@@ -162,9 +170,27 @@ func (kv *KnockValidator) Validate(req *http.Request) []byte {
 	copy(presentedKnock[16:32], requestID)
 	copy(presentedKnock[32:48], clientToken)
 
-	// Get current and adjacent time windows
+	// Reject replayed knocks
+	knockKey := hex.EncodeToString(presentedKnock)
+	kv.seenMu.Lock()
+	// Prune expired entries
 	now := time.Now().Unix()
-	currentWindow := now / int64(kv.window.Seconds())
+	for k, expiry := range kv.seenKnocks {
+		if now > expiry {
+			delete(kv.seenKnocks, k)
+		}
+	}
+	if _, seen := kv.seenKnocks[knockKey]; seen {
+		kv.seenMu.Unlock()
+		return nil // Replay rejected
+	}
+	kv.seenMu.Unlock()
+
+	windowSecs := int64(kv.window.Seconds())
+	if windowSecs <= 0 {
+		windowSecs = 30
+	}
+	currentWindow := now / windowSecs
 
 	// Try current and adjacent windows (for clock skew)
 	for _, windowOffset := range []int64{0, -1, 1} {
@@ -176,6 +202,10 @@ func (kv *KnockValidator) Validate(req *http.Request) []byte {
 
 			// Constant-time comparison to prevent timing attacks
 			if hmac.Equal(presentedKnock, expectedKnock[:48]) {
+				// Mark as used — expires after 2 windows to cover clock skew
+				kv.seenMu.Lock()
+				kv.seenKnocks[knockKey] = now + windowSecs*3
+				kv.seenMu.Unlock()
 				return clientPubKey
 			}
 		}

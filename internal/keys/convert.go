@@ -44,6 +44,9 @@ func Ed25519SeedToX25519(seed []byte) (privateKey [32]byte, publicKey [32]byte, 
 	point := edwards25519.NewGeneratorPoint().ScalarBaseMult(scalar)
 	copy(publicKey[:], point.BytesMontgomery())
 
+	// Wipe the SHA-512 intermediate from memory
+	WipeBytes(h[:])
+
 	return privateKey, publicKey, nil
 }
 

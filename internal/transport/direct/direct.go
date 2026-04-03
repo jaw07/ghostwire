@@ -120,7 +120,7 @@ func (t *Transport) Listen(ctx context.Context, addr string) (transport.Listener
 		if err != nil {
 			return nil, fmt.Errorf("listen udp: %w", err)
 		}
-		return &udpListener{conn: conn}, nil
+		return newUDPListener(conn), nil
 
 	default:
 		return nil, fmt.Errorf("unsupported network: %s", t.cfg.Network)
@@ -164,46 +164,94 @@ func (l *tcpListener) Addr() net.Addr {
 	return l.listener.Addr()
 }
 
-// udpListener wraps a UDP connection as a pseudo-listener
+// udpListener wraps a UDP connection as a pseudo-listener with per-remote-address
+// connection demuxing. Each unique remote address gets its own virtual connection
+// with a dedicated receive buffer.
 type udpListener struct {
-	conn   *net.UDPConn
-	mu     sync.Mutex
-	closed bool
+	conn    *net.UDPConn
+	mu      sync.Mutex
+	closed  bool
+	clients map[string]*udpVirtualConn // remoteAddr string -> vconn
+	acceptQ chan *udpVirtualConn        // new connections for Accept()
+	done    chan struct{}
+}
+
+func newUDPListener(conn *net.UDPConn) *udpListener {
+	l := &udpListener{
+		conn:    conn,
+		clients: make(map[string]*udpVirtualConn),
+		acceptQ: make(chan *udpVirtualConn, 64),
+		done:    make(chan struct{}),
+	}
+	go l.readLoop()
+	return l
+}
+
+func (l *udpListener) readLoop() {
+	buf := make([]byte, 65536)
+	for {
+		n, remoteAddr, err := l.conn.ReadFromUDP(buf)
+		if err != nil {
+			close(l.acceptQ)
+			return
+		}
+
+		key := remoteAddr.String()
+		data := make([]byte, n)
+		copy(data, buf[:n])
+
+		l.mu.Lock()
+		vconn, exists := l.clients[key]
+		if !exists {
+			// New remote — create virtual connection
+			vconn = &udpVirtualConn{
+				conn:       l.conn,
+				localAddr:  l.conn.LocalAddr(),
+				remoteAddr: remoteAddr,
+				recvCh:     make(chan []byte, 256),
+				closeCh:    make(chan struct{}),
+				onClose: func() {
+					l.mu.Lock()
+					delete(l.clients, key)
+					l.mu.Unlock()
+				},
+			}
+			l.clients[key] = vconn
+			l.mu.Unlock()
+
+			// Queue for Accept
+			select {
+			case l.acceptQ <- vconn:
+			default:
+				// Accept queue full — drop connection
+			}
+		} else {
+			l.mu.Unlock()
+		}
+
+		// Deliver packet to the virtual connection
+		select {
+		case vconn.recvCh <- data:
+		default:
+			// Drop if buffer full
+		}
+	}
 }
 
 func (l *udpListener) Accept() (net.Conn, error) {
-	// For UDP, we create virtual connections per remote address
-	// This is a simplified implementation - a full implementation would
-	// manage a connection table per remote address
-	buf := make([]byte, 65536)
-	for {
-		l.mu.Lock()
-		if l.closed {
-			l.mu.Unlock()
-			return nil, fmt.Errorf("listener closed")
-		}
-		l.mu.Unlock()
-
-		n, remoteAddr, err := l.conn.ReadFromUDP(buf)
-		if err != nil {
-			return nil, err
-		}
-
-		// Create a virtual connection for this remote
-		vconn := &udpVirtualConn{
-			conn:       l.conn,
-			localAddr:  l.conn.LocalAddr(),
-			remoteAddr: remoteAddr,
-			readBuf:    make([]byte, n),
-		}
-		copy(vconn.readBuf, buf[:n])
-		return transport.NewConnWrapper(vconn, Name, nil), nil
+	vconn, ok := <-l.acceptQ
+	if !ok {
+		return nil, net.ErrClosed
 	}
+	return transport.NewConnWrapper(vconn, Name, nil), nil
 }
 
 func (l *udpListener) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.closed {
+		return nil
+	}
 	l.closed = true
 	return l.conn.Close()
 }
@@ -212,29 +260,28 @@ func (l *udpListener) Addr() net.Addr {
 	return l.conn.LocalAddr()
 }
 
-// udpVirtualConn wraps a UDP connection with a specific remote address
+// udpVirtualConn is a per-remote-address virtual connection over a shared
+// UDP socket. Each remote gets its own receive channel for proper demuxing.
 type udpVirtualConn struct {
 	conn       *net.UDPConn
 	localAddr  net.Addr
 	remoteAddr *net.UDPAddr
-	readBuf    []byte
-	readOnce   bool
-	mu         sync.Mutex
+	recvCh     chan []byte
+	closeCh    chan struct{}
+	closeOnce  sync.Once
+	onClose    func()
 }
 
 func (c *udpVirtualConn) Read(b []byte) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if !c.readOnce && len(c.readBuf) > 0 {
-		n := copy(b, c.readBuf)
-		c.readOnce = true
-		return n, nil
+	select {
+	case data, ok := <-c.recvCh:
+		if !ok {
+			return 0, net.ErrClosed
+		}
+		return copy(b, data), nil
+	case <-c.closeCh:
+		return 0, net.ErrClosed
 	}
-
-	// For subsequent reads, read from the UDP connection
-	// Note: This is simplified - a real implementation would filter by remote addr
-	return c.conn.Read(b)
 }
 
 func (c *udpVirtualConn) Write(b []byte) (int, error) {
@@ -242,7 +289,12 @@ func (c *udpVirtualConn) Write(b []byte) (int, error) {
 }
 
 func (c *udpVirtualConn) Close() error {
-	// Don't close the underlying connection as it's shared
+	c.closeOnce.Do(func() {
+		close(c.closeCh)
+		if c.onClose != nil {
+			c.onClose()
+		}
+	})
 	return nil
 }
 

@@ -2,7 +2,9 @@ package gossip
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -99,6 +101,10 @@ type Gossip struct {
 	// Suspicion timers
 	suspicion   map[string]*time.Timer
 	suspicionMu sync.Mutex
+
+	// Replay deduplication: seen message hashes with expiry
+	seenMsgs   map[uint64]int64 // hash -> expiry unix nano
+	seenMsgsMu sync.Mutex
 }
 
 type broadcastItem struct {
@@ -121,6 +127,7 @@ func New(cfg *Config, self *Member) (*Gossip, error) {
 		shutdown:  make(chan struct{}),
 		ackCh:     make(map[uint64]chan *Message),
 		suspicion: make(map[string]*time.Timer),
+		seenMsgs:  make(map[uint64]int64),
 	}
 
 	return g, nil
@@ -129,7 +136,7 @@ func New(cfg *Config, self *Member) (*Gossip, error) {
 // Start begins the gossip protocol
 func (g *Gossip) Start() error {
 	var err error
-	g.conn, err = net.ListenPacket("udp", g.cfg.BindAddr)
+	g.conn, err = net.ListenPacket("udp4", g.cfg.BindAddr)
 	if err != nil {
 		return fmt.Errorf("bind gossip: %w", err)
 	}
@@ -672,35 +679,67 @@ func (g *Gossip) sendTo(msg *Message, addr net.Addr) error {
 	return err
 }
 
+func (g *Gossip) hmacMessage(msg *Message) []byte {
+	mac := hmac.New(sha256.New, g.cfg.MeshSecret)
+	binary.Write(mac, binary.BigEndian, msg.Timestamp)
+	mac.Write([]byte(msg.From))
+	mac.Write([]byte{byte(msg.Type)})
+	binary.Write(mac, binary.BigEndian, msg.SeqNo)
+	mac.Write([]byte(msg.Target))
+	mac.Write(msg.Digest)
+	for _, m := range msg.Members {
+		mac.Write([]byte(m.NodeID))
+		mac.Write([]byte{byte(m.State)})
+		binary.Write(mac, binary.BigEndian, m.Incarnation)
+	}
+	return mac.Sum(nil)[:16]
+}
+
 func (g *Gossip) signHMAC(msg *Message) {
-	h := sha256.New()
-	h.Write(g.cfg.MeshSecret)
-	binary.Write(h, binary.BigEndian, msg.Timestamp)
-	h.Write([]byte(msg.From))
-	msg.HMAC = h.Sum(nil)[:16]
+	msg.HMAC = g.hmacMessage(msg)
 }
 
 func (g *Gossip) verifyHMAC(msg *Message) bool {
-	h := sha256.New()
-	h.Write(g.cfg.MeshSecret)
-	binary.Write(h, binary.BigEndian, msg.Timestamp)
-	h.Write([]byte(msg.From))
-	expected := h.Sum(nil)[:16]
-
-	if len(msg.HMAC) != len(expected) {
-		return false
-	}
-	for i := range expected {
-		if msg.HMAC[i] != expected[i] {
-			return false
-		}
-	}
-
-	// Check timestamp freshness (within 30 seconds)
+	// Check timestamp freshness first (within 30 seconds)
 	ts := time.Unix(0, msg.Timestamp)
 	if time.Since(ts).Abs() > 30*time.Second {
 		return false
 	}
 
+	expected := g.hmacMessage(msg)
+	if subtle.ConstantTimeCompare(msg.HMAC, expected) != 1 {
+		return false
+	}
+
+	// Reject replayed messages using a hash of (From, SeqNo, Timestamp)
+	msgHash := g.messageHash(msg)
+	now := time.Now().UnixNano()
+	expiry := now + int64(30*time.Second)
+
+	g.seenMsgsMu.Lock()
+	// Prune expired entries (bounded to prevent unbounded growth)
+	if len(g.seenMsgs) > 10000 {
+		for k, exp := range g.seenMsgs {
+			if now > exp {
+				delete(g.seenMsgs, k)
+			}
+		}
+	}
+	if _, seen := g.seenMsgs[msgHash]; seen {
+		g.seenMsgsMu.Unlock()
+		return false // Replay rejected
+	}
+	g.seenMsgs[msgHash] = expiry
+	g.seenMsgsMu.Unlock()
+
 	return true
+}
+
+func (g *Gossip) messageHash(msg *Message) uint64 {
+	h := sha256.New()
+	h.Write([]byte(msg.From))
+	binary.Write(h, binary.BigEndian, msg.SeqNo)
+	binary.Write(h, binary.BigEndian, msg.Timestamp)
+	sum := h.Sum(nil)
+	return binary.BigEndian.Uint64(sum[:8])
 }

@@ -283,7 +283,7 @@ func (m *Monitor) checkDeadSwitches() {
 		if c.Type != TypeDeadSwitch {
 			continue
 		}
-		if c.Triggered {
+		if c.IsTriggered() {
 			continue
 		}
 
@@ -380,7 +380,7 @@ func (m *Monitor) Stats() Stats {
 		case TypeHoneypot:
 			stats.Honeypots++
 		}
-		if c.Triggered {
+		if c.IsTriggered() {
 			stats.TriggeredCount++
 		}
 	}
