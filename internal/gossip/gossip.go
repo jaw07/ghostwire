@@ -198,8 +198,9 @@ func (g *Gossip) Broadcast(members []*Member) {
 	g.queueBroadcast(msg)
 }
 
-// BroadcastPayload queues a custom typed message with an arbitrary payload for
-// dissemination across the mesh.
+// BroadcastPayload sends a custom typed message with an arbitrary payload
+// directly to all alive members. Unlike member broadcasts which are piggybacked
+// on pings, payload messages are sent as standalone UDP messages.
 func (g *Gossip) BroadcastPayload(msgType MessageType, payload []byte) {
 	msg := &Message{
 		Type:      msgType,
@@ -208,7 +209,16 @@ func (g *Gossip) BroadcastPayload(msgType MessageType, payload []byte) {
 		Timestamp: time.Now().UnixNano(),
 	}
 
-	g.queueBroadcast(msg)
+	// Send directly to all alive members
+	members := g.members.AliveMembers()
+	for _, m := range members {
+		if len(m.Endpoints) > 0 {
+			addr, err := net.ResolveUDPAddr("udp", m.Endpoints[0])
+			if err == nil {
+				g.sendTo(msg, addr)
+			}
+		}
+	}
 }
 
 // SetCustomHandler registers a callback that is invoked whenever a custom

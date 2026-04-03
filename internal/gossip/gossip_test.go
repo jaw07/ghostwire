@@ -879,27 +879,39 @@ func TestGetBroadcasts_LimitRespected(t *testing.T) {
 
 func TestBroadcastChat(t *testing.T) {
 	self := makeMember("node1", StateAlive, 1)
-	g, _ := New(DefaultConfig(), self)
+	cfg := DefaultConfig()
+	cfg.MeshSecret = []byte("test-secret-32-bytes-long-xxxxx")
+	g, _ := New(cfg, self)
 
+	// BroadcastPayload sends directly to alive members.
+	// With no alive members, it just returns (no crash).
 	payload := []byte(`{"text":"hello mesh"}`)
-	g.BroadcastPayload(MsgChat, payload)
+	g.BroadcastPayload(MsgChat, payload) // should not panic
+
+	// Test that handleCustomBroadcast re-queues for further propagation
+	msg := &Message{
+		Type:    MsgChat,
+		From:    "node2",
+		Payload: json.RawMessage(payload),
+	}
+	g.handleCustomBroadcast(msg)
 
 	msgs := g.getBroadcasts(10)
 	if len(msgs) != 1 {
 		t.Fatalf("getBroadcasts returned %d messages, want 1", len(msgs))
 	}
 
-	msg := msgs[0]
-	if msg.Type != MsgChat {
-		t.Fatalf("msg.Type = %v, want MsgChat (%v)", msg.Type, MsgChat)
+	got := msgs[0]
+	if got.Type != MsgChat {
+		t.Fatalf("msg.Type = %v, want MsgChat (%v)", got.Type, MsgChat)
 	}
 
-	var got map[string]string
-	if err := json.Unmarshal(msg.Payload, &got); err != nil {
+	var parsed map[string]string
+	if err := json.Unmarshal(got.Payload, &parsed); err != nil {
 		t.Fatalf("failed to unmarshal payload: %v", err)
 	}
-	if got["text"] != "hello mesh" {
-		t.Fatalf("payload text = %q, want %q", got["text"], "hello mesh")
+	if parsed["text"] != "hello mesh" {
+		t.Fatalf("payload text = %q, want %q", parsed["text"], "hello mesh")
 	}
 }
 
