@@ -503,26 +503,26 @@ Encrypted mesh chat between nodes. Messages broadcast via gossip, displayed in t
 
 ```
 Node A (GUI)                    Gossip                    Node B (GUI)
-  |                               |                          |
-  |  User types message            |                         |
-  |-- POST /api/chat ------------>|                          |
-  |                               |                          |
-  |  ChatService.Send()            |                         |
-  |  OnSend callback:              |                         |
-  |    json.Marshal(ChatMessage)   |                         |
-  |    gossip.BroadcastPayload(    |                         |
-  |      MsgChat, payload)         |                         |
-  |                               |                          |
-  |    UDP send to all alive ----->|--- UDP to Node B ------>|
-  |    members directly            |                         |
-  |                               |   verifyHMAC (covers     |
-  |                               |     Payload field)       |
-  |                               |   handleCustomBroadcast  |
-  |                               |   ChatService.Receive()  |
-  |                               |   OnReceive callback:    |
-  |                               |     BroadcastChat() ---->|  WebSocket push
-  |                               |                          |  updateChat(msg)
-  |                               |                          |
+  |                                |                          |
+  |  User types message            |                          |
+  |-- POST /api/chat ------------> |                          |
+  |                                |                          |
+  |  ChatService.Send()            |                          |
+  |  OnSend callback:              |                          |
+  |    json.Marshal(ChatMessage)   |                          |
+  |    gossip.BroadcastPayload(    |                          |
+  |      MsgChat, payload)         |                          |
+  |                                |                          |
+  |    UDP send to all alive ----->|--- UDP to Node B ------> |
+  |    members directly            |                          |
+  |                                |   verifyHMAC (covers     |
+  |                                |     Payload field)       |
+  |                                |   handleCustomBroadcast  |
+  |                                |   ChatService.Receive()  |
+  |                                |   OnReceive callback:    |
+  |                                |     BroadcastChat() ---->|  WebSocket push
+  |                                |                          |  updateChat(msg)
+  |                                |                          |
 ```
 
 Chat messages are HMAC-authenticated (the `Payload` field is included in the gossip HMAC computation) and replay-deduplicated. History capped at 200 messages per node.
@@ -537,26 +537,30 @@ API:
 UDP proxy for MAVLink drone telemetry. Listens on port 14550, forwards packets through the encrypted mesh tunnel.
 
 ```
-Ground Control          Node A              WireGuard           Node B              Autopilot
-(QGroundControl)        (MAVLink proxy)     Mesh Tunnel         (MAVLink proxy)     (Pixhawk)
-  |                       |                   |                   |                   |
-  |-- MAVLink UDP ------->| :14550            |                   |                   |
-  |   (HEARTBEAT,         |                   |                   |                   |
-  |    COMMAND_LONG, etc)  |  Parse header:    |                   |                   |
-  |                       |  sysid, msgid     |                   |                   |
-  |                       |  OnPacket callback |                   |                   |
-  |                       |                   |                   |                   |
-  |                       |  Packet goes       |                   |                   |
-  |                       |  through TUN/gw0 ->| WG encrypt ------>| TUN/gw0 -------->|
-  |                       |                   |  (HTTPS-mimic      |                   |
-  |                       |                   |   WebSocket frames) |                   |
-  |                       |                   |                   |  UDP forward ----->|
-  |                       |                   |                   |  to local          |
-  |                       |                   |                   |  autopilot         |
-  |                       |                   |                   |                   |
-  |<-- telemetry ---------|<------------------|<------------------|<-- MAVLink UDP ----|
-  |   (ATTITUDE,          |  Deliver()         |                   |                   |
-  |    GPS_RAW_INT, etc)  |                   |                   |                   |
+GCS (QGroundControl)                              Autopilot (Pixhawk)
+  |                                                 |
+  |-- MAVLink UDP -->  Node A :14550                |
+  |   HEARTBEAT        |                            |
+  |   COMMAND_LONG     |  parse sysid, msgid        |
+  |                    |  OnPacket callback          |
+  |                    |                            |
+  |                    +-- TUN/gw0 interface         |
+  |                    |                            |
+  |                    |   WireGuard encrypt         |
+  |                    |   HTTPS-mimic transport     |
+  |                    |   WebSocket frames          |
+  |                    |                            |
+  |                    +===== encrypted mesh =====>  Node B :14550
+  |                                                 |
+  |                                                 |  Deliver() to
+  |                                                 |  local autopilot
+  |                                                 |
+  |                              encrypted mesh  <==+
+  |                                                 |
+  |  <-- telemetry --  Node A                       |
+  |      ATTITUDE      |  Deliver()                 |
+  |      GPS_RAW_INT   |                            |
+  |                                                 |
 ```
 
 Packet parser extracts MAVLink v1 (0xFE) and v2 (0xFD) headers:
