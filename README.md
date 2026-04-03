@@ -542,13 +542,13 @@ GCS (QGroundControl)                              Autopilot (Pixhawk)
   |-- MAVLink UDP -->  Node A :14550                |
   |   HEARTBEAT        |                            |
   |   COMMAND_LONG     |  parse sysid, msgid        |
-  |                    |  OnPacket callback          |
+  |                    |  OnPacket callback         |
   |                    |                            |
-  |                    +-- TUN/gw0 interface         |
+  |                    +-- TUN/gw0 interface        |
   |                    |                            |
-  |                    |   WireGuard encrypt         |
-  |                    |   HTTPS-mimic transport     |
-  |                    |   WebSocket frames          |
+  |                    |   WireGuard encrypt        |
+  |                    |   HTTPS-mimic transport    |
+  |                    |   WebSocket frames         |
   |                    |                            |
   |                    +===== encrypted mesh =====>  Node B :14550
   |                                                 |
