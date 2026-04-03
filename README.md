@@ -65,7 +65,7 @@ Session flow as seen on the wire:
 Client                                       Server
   |                                            |
   |-- TLS 1.3 ClientHello ------------------>  |
-  |<- TLS 1.3 ServerHello + Finished -------  |
+  |<- TLS 1.3 ServerHello + Finished --------> |
   |                                            |
   |-- POST /api/v1/telemetry/{knock} ------->  |  HKDF-derived headers
   |   X-Request-ID: {hex}                      |
@@ -119,8 +119,8 @@ Validation: server recomputes knock for each known client across windows `{W, W-
 |                   Masked payload (XOR'd with MaskKey)                 |
 +--------+------+----------+----------+---------------------------------+
 | +0     | 2    | RealLen  | XOR'd    | BigEndian(realLen) XOR lenMask  |
-| +2     | var  | Data     | WG pkt   | WireGuard packet (realLen B)   |
-| +2+rl  | var  | Padding  | random   | 4-64 bytes from crypto/rand    |
+| +2     | var  | Data     | WG pkt   | WireGuard packet (realLen B)    |
+| +2+rl  | var  | Padding  | random   | 4-64 bytes from crypto/rand     |
 +--------+------+----------+----------+---------------------------------+
 
 lenMask  = 2 random bytes, sent as first message after WebSocket upgrade
@@ -183,10 +183,10 @@ Step 5 prevents MITM: an attacker substituting a rogue CA would fail the fingerp
 Node                                           Admin
   |                                              |
   |  nonce = random(16 bytes)                    |
-  |  sig = Sign(node_key,                       |
-  |          "node_id:cert_hash:nonce:ts")      |
+  |  sig = Sign(node_key,                        |
+  |          "node_id:cert_hash:nonce:ts")       |
   |                                              |
-  |-- POST /renew ----------------------------->  |
+  |-- POST /renew -----------------------------> |
   |   {node_id, cert_hash, nonce, ts, sig}       |
   |                                              |
   |                          Verify sig against  |
@@ -432,7 +432,7 @@ Alice                                            Bob
   |  x25519_eph = random X25519 keypair            |
   |  kyber_eph  = random Kyber-768 keypair         |
   |                                                |
-  |--- x25519_eph.pub, kyber_eph.pub ------------>|
+  |--- x25519_eph.pub, kyber_eph.pub ------------> | 
   |                                                |
   |                     x25519_ss = X25519(        |
   |                       bob_priv, alice_x25519)  |
@@ -465,20 +465,20 @@ Node A (behind NAT)            Relay             Node B (behind NAT)
   |  stun.l.google.com:19302     |                  |
   |<-- external addr A' ---------|                  |
   |                              |                  |
-  |--- HolePunchReq{A', B'} --->|                  |
+  |--- HolePunchReq{A', B'} ---> |                  |
   |                              |--- forward ----->|
   |                              |                  |
   |                              |    STUN query    |
   |                              |<-- addr B' ------|
   |                              |                  |
-  |<======= 5 UDP packets at 50ms intervals ======>|
+  |<======= 5 UDP packets at 50ms intervals ======> |
   |          (both sides send simultaneously)       |
   |                              |                  |
   |  NAT mapping opens:          |                  |
   |  outbound pkt matches        |                  |
   |  inbound source addr         |                  |
   |                              |                  |
-  |<=========== direct WireGuard tunnel ==========>|
+  |<=========== direct WireGuard tunnel ==========> |
   |              (relay no longer needed)           |
 ```
 
@@ -488,10 +488,10 @@ NAT classification via STUN:
 +----------------------------+------------------------------------------+
 | Condition                  | Classification                           |
 +----------------------------+------------------------------------------+
-| A1:P1 == local addr        | NATNone       - public IP, no NAT       |
-| A1 == A2 and P1 == P2      | NATFull       - full cone               |
-| A1 == A2 and P1 != P2      | NATRestricted - port-restricted cone    |
-| A1 != A2                   | NATSymmetric  - not hole-punchable      |
+| A1:P1 == local addr        | NATNone       - public IP, no NAT        |
+| A1 == A2 and P1 == P2      | NATFull       - full cone                |
+| A1 == A2 and P1 != P2      | NATRestricted - port-restricted cone     |
+| A1 != A2                   | NATSymmetric  - not hole-punchable       |
 +----------------------------+------------------------------------------+
 A1:P1 = external addr from STUN server 1
 A2:P2 = external addr from STUN server 2

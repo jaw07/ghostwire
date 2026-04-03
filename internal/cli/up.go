@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -26,11 +27,13 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ghostwire/ghostwire/internal/api"
+	"github.com/ghostwire/ghostwire/internal/chat"
 	"github.com/ghostwire/ghostwire/internal/config"
-	"github.com/ghostwire/ghostwire/internal/gui"
 	"github.com/ghostwire/ghostwire/internal/daemon"
 	"github.com/ghostwire/ghostwire/internal/gossip"
+	"github.com/ghostwire/ghostwire/internal/gui"
 	"github.com/ghostwire/ghostwire/internal/keys"
+	"github.com/ghostwire/ghostwire/internal/mavlink"
 	"github.com/ghostwire/ghostwire/internal/pki"
 	"github.com/ghostwire/ghostwire/internal/policy"
 	"github.com/ghostwire/ghostwire/internal/routing"
@@ -349,6 +352,52 @@ func startDaemon(configDir string, foreground bool) error {
 			fmt.Printf("  Route update: %s via %s\n", nodeID, routes[0].Type)
 		}
 	})
+
+	// Initialize chat service
+	chatService := chat.New(meshConfig.NodeID, 200)
+	chatService.OnSend = func(msg chat.ChatMessage) {
+		data, _ := json.Marshal(msg)
+		gossipService.BroadcastPayload(gossip.MsgChat, data)
+		if guiServer != nil {
+			guiServer.BroadcastChat(msg.Sender, msg.Text, msg.Timestamp)
+		}
+	}
+	chatService.OnReceive = func(msg chat.ChatMessage) {
+		if guiServer != nil {
+			guiServer.BroadcastChat(msg.Sender, msg.Text, msg.Timestamp)
+		}
+	}
+	gossipService.SetCustomHandler(func(msgType gossip.MessageType, from string, payload []byte) {
+		if msgType == gossip.MsgChat {
+			var msg chat.ChatMessage
+			if json.Unmarshal(payload, &msg) == nil {
+				chatService.Receive(msg)
+			}
+		}
+	})
+	if guiServer != nil {
+		guiServer.SetChatHandler(func(text string) {
+			chatService.Send(text)
+		})
+	}
+	fmt.Println("  Chat service initialized")
+
+	// Initialize MAVLink proxy
+	mavProxy := mavlink.NewProxy(&mavlink.ProxyConfig{
+		ListenAddr: "0.0.0.0:14550",
+		OnPacket: func(data []byte, info *mavlink.PacketInfo) {
+			fmt.Printf("  MAVLink: %s from %s seq=%d\n",
+				mavlink.MessageIDString(info.MessageID),
+				mavlink.SystemIDString(info.SystemID),
+				info.Sequence)
+		},
+	})
+	if err := mavProxy.Start(); err != nil {
+		fmt.Printf("Warning: MAVLink proxy not started: %v\n", err)
+	} else {
+		fmt.Printf("  MAVLink proxy on %s\n", mavProxy.ListenAddr())
+		defer mavProxy.Stop()
+	}
 
 	// Set up gossip callbacks to update routing + GUI + knock validator + WG peers
 	gossipService.Members().SetCallbacks(
