@@ -61,48 +61,237 @@ Crypto
 
 Session flow as seen on the wire:
 
-1. TLS 1.3 handshake
-2. HTTP POST to `/api/v1/telemetry/{knock}` with HKDF-derived headers
-3. Server responds `101 Switching Protocols` (WebSocket upgrade)
-4. Client sends 2-byte XOR-masked length key
-5. All subsequent data: RFC 6455 binary frames with MASK bit, random padding (4-64 bytes), XOR-masked payload length
+```
+Client                                  Server
+  |                                       |
+  |-- TLS 1.3 ClientHello ------------->  |
+  |<- TLS 1.3 ServerHello + Finished --  |
+  |                                       |
+  |-- POST /api/v1/telemetry/{knock} ->  |  Knock: HKDF-derived path + headers
+  |   X-Request-ID: {hex}                |
+  |   X-Client-Token: {hex}              |
+  |   Content-Type: application/json      |
+  |   {"session_id":"...","event_count":1}|  Body: plausible telemetry JSON
+  |                                       |
+  |<- 101 Switching Protocols ----------  |  WebSocket upgrade response
+  |   Upgrade: websocket                  |
+  |   Sec-WebSocket-Accept: {base64}      |
+  |                                       |
+  |-- [LenMask: 2 bytes] -------------->  |  Per-session XOR key for length field
+  |                                       |
+  |== WebSocket binary frames ==========  |  All subsequent traffic
+  |   [0x82][len][MASK key][payload]      |  RFC 6455 with MASK bit set
+  |                                       |
+  |   payload = [maskedLen:2][WG pkt][pad]|  WG packet + 4-64 random bytes
+  |                                       |
+```
 
-Unauthenticated connections get a static HTML page.
+### Knock derivation
 
-Knock derivation: `HKDF-SHA256(mesh_secret, client_pubkey || BigEndian(time_window))` producing 64 bytes split into path, request ID, client token, reserved. One-time use (server-side replay cache with TTL).
+```
+mesh_secret     = 32 bytes (shared across mesh)
+client_pubkey   = 32 bytes (X25519 public key)
+time_window     = floor(unix_timestamp / window_seconds)
+info            = client_pubkey || BigEndian(time_window)
+
+knock_material  = HKDF-SHA256(secret=mesh_secret, info=info, length=64)
+
+path_knock      = knock_material[0:16]    -> hex-encoded in URL path
+request_id      = knock_material[16:32]   -> X-Request-ID header
+client_token    = knock_material[32:48]   -> X-Client-Token header
+reserved        = knock_material[48:64]
+```
+
+Validation: server recomputes knock for each known client across windows `{W, W-1, W+1}` (clock skew tolerance). Constant-time comparison via `crypto/subtle`. Used knocks stored in replay cache with TTL = 3 * window.
+
+### WebSocket frame format
+
+```
+ 0                   1                   2
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-------+-+-------------+-----------+
+|F|R|R|R| opcode|M| Payload len | Ext len   |
+|I|S|S|S|  (4)  |A|   (7)      | (16/64)   |
+|N|V|V|V|       |S|             |           |
+| |1|2|3|       |K|             |           |
++-+-+-+-+-------+-+-------------+-----------+
+| Masking key (4 bytes, if MASK set)        |
++-------------------------------------------+
+| maskedRealLen XOR lenMask (2 bytes)       |
++-------------------------------------------+
+| WireGuard packet (realLen bytes)          |
++-------------------------------------------+
+| Random padding (4-64 bytes, crypto/rand)  |
++-------------------------------------------+
+
+opcode    = 0x82 (binary frame, FIN set)
+MASK      = 1 for client->server per RFC 6455
+lenMask   = 2 random bytes, sent as first message after upgrade
+maskedRealLen = BigEndian(realLen) XOR lenMask
+padding   = crypto/rand bytes, length from crypto/rand (not payload-derived)
+```
+
+DPI sees standard WebSocket binary frames. The XOR-masked length field prevents statistical correlation between frame size and payload size.
 
 ## PKI
 
-- CA: Ed25519, 2-year validity. Mesh ID = SHA-256(CA pubkey).
-- Node certs: X.509, 24-hour validity, auto-renewed at T-6h.
-- Custom extensions (OID 1.3.6.1.4.1.99999.1.x): NodeID, Roles (critical), MeshID (critical), WireGuard pubkey, Compartment, AllowedNetworks.
-- Enrollment: token-based over TLS 1.3. CA fingerprint verified against mesh ID in token.
-- Renewal: signed request with random nonce. Server verifies against registered public key and deduplicates nonces.
+### Certificate hierarchy
+
+```
+Root CA (Ed25519, 2-year validity, offline)
+  Mesh ID = SHA-256(CA_public_key)       -- 32 bytes, identifies the mesh
+  |
+  +-- Node Certificate (Ed25519, 24-hour validity)
+        Subject CN = node_id
+        IPAddresses = [mesh_ip]
+        Extensions:
+          1.3.6.1.4.1.99999.1.1  NodeID          (string, non-critical)
+          1.3.6.1.4.1.99999.1.2  Roles           (string[], critical)
+          1.3.6.1.4.1.99999.1.3  AllowedNetworks (CIDR+direction, critical)
+          1.3.6.1.4.1.99999.1.4  MeshID          (32 bytes, critical)
+          1.3.6.1.4.1.99999.1.5  Compartment     (string, non-critical)
+          1.3.6.1.4.1.99999.1.6  WGPubKey        (32 bytes X25519, non-critical)
+```
+
+### Enrollment flow
+
+```
+Admin                              New Node
+  |                                   |
+  |  1. Generate token:               |
+  |     token = Sign(CA_key,          |
+  |       {id, mesh_id, roles,        |
+  |        not_before, not_after,     |
+  |        max_uses})                 |
+  |                                   |
+  |<--- POST /enroll {token, pubkey}  |  2. Node generates Ed25519 + X25519 keypair
+  |                                   |
+  |  3. Validate token signature      |
+  |     Check expiry, usage count     |
+  |     Allocate mesh IP              |
+  |     Issue X.509 certificate       |
+  |                                   |
+  |--- {cert, ca_cert, peers,     --->|  4. Response includes mesh config
+  |     mesh_secret, transport}       |
+  |                                   |
+  |                                   |  5. Node verifies:
+  |                                   |     SHA-256(ca_cert.pubkey) == token.mesh_id
+  |                                   |     cert chains to ca_cert
+```
+
+Step 5 prevents MITM: an attacker substituting a rogue CA would fail the fingerprint check because the mesh ID is embedded in the token signed by the real CA.
+
+### Certificate renewal
+
+```
+Node                               Admin
+  |                                   |
+  |  nonce = random(16 bytes)         |
+  |  sig = Sign(node_key,            |
+  |    "node_id:cert_hash:nonce:ts") |
+  |                                   |
+  |--- POST /renew {node_id,     --->|
+  |     cert_hash, nonce, ts, sig}   |
+  |                                   |
+  |  Verify sig against registered    |
+  |  key (not request key)            |
+  |  Verify cert_hash matches         |
+  |  Reject replayed nonce            |
+  |  Preserve roles from current cert |
+  |                                   |
+  |<--- {new_cert, expires_at} -------|
+```
 
 ## Key derivation
 
 ```
-Ed25519 seed (32 bytes)
-  -> SHA-512 -> clamp per RFC 7748 -> X25519 private key (32 bytes)
-  -> ScalarBaseMult -> X25519 public key (32 bytes)
+seed (32 random bytes)
+  |
+  v
+Ed25519 private key = ed25519.NewKeyFromSeed(seed)
+Ed25519 public key  = private.Public()
+  |
+  v
+h = SHA-512(seed)                    -- 64 bytes
+h[0]  &= 248                        -- clear bottom 3 bits  \
+h[31] &= 127                        -- clear top bit         | RFC 7748 clamping
+h[31] |= 64                         -- set second-to-top bit /
+  |
+  v
+X25519 private key = h[0:32]
+X25519 public key  = ScalarBaseMult(private, basepoint)
+  |
+  v
+WireGuard uses X25519 keypair for Noise IK handshake
+Knock uses X25519 public key as HKDF info component
+  |
+  v
+defer WipeBytes(x25519_private)      -- zeroed after tunnel creation
+WipeBytes(h[:])                      -- SHA-512 intermediate zeroed immediately
 ```
 
-Same key used for WireGuard and knock HKDF info field. Private key and SHA-512 intermediate zeroed after use.
+The Ed25519 and X25519 keys are mathematically linked via the birational equivalence between the twisted Edwards curve (Ed25519) and the Montgomery curve (Curve25519). The conversion uses `edwards25519.ScalarBaseMult` followed by `BytesMontgomery()` for the Edwards-to-Montgomery point mapping.
 
 ## Gossip
 
-SWIM protocol over UDP port 7946 (`udp4`).
+SWIM (Scalable Weakly-consistent Infection-style Membership) over UDP port 7946.
 
-- Probe: 2s interval, random alive member, indirect probes on timeout
-- Gossip: 1s interval, digest exchange, delta sync
-- HMAC: SHA-256 over all message fields (type, seqno, from, target, members, digest, timestamp), truncated to 16 bytes
-- Freshness: 30-second window
-- Replay: per-message hash deduplication (bounded LRU, 10k entries)
-- Merge: higher incarnation wins, tie-break dead > suspect > alive
+### Protocol cycles
 
-## Policy
+```
+Every 2 seconds (probe):
+  1. Pick random alive member M
+  2. Send Ping{seqno, self_state, piggybacked_broadcasts}
+  3. If no Ack within 3s:
+     a. Pick 3 random members as helpers
+     b. Send PingReq{target=M} to each helper
+     c. Helper pings M, forwards Ack back
+  4. If still no Ack after 3s: mark M as suspect
+  5. After 15s suspect timeout: mark M as dead, broadcast
 
-Default-deny. Rules evaluated by priority (descending), first match wins.
+Every 1 second (gossip):
+  1. Pick random alive member
+  2. Send Sync{digest=SHA256(all member incarnations)}
+  3. If digests differ: recipient responds with full member list
+  4. Merge received state
+```
+
+### Message authentication
+
+```
+HMAC = HMAC-SHA256(mesh_secret,
+  timestamp(8 bytes) ||
+  from(string) ||
+  type(1 byte) ||
+  seqno(8 bytes) ||
+  target(string) ||
+  digest(bytes) ||
+  for each member: nodeID || state(1 byte) || incarnation(8 bytes)
+)[0:16]
+
+Verification:
+  1. Check |now - timestamp| <= 30 seconds
+  2. Constant-time compare HMAC
+  3. Compute msg_hash = SHA-256(from || seqno || timestamp)[0:8]
+  4. Reject if msg_hash in seen set (bounded to 10k entries)
+  5. Add msg_hash to seen set with 30s TTL
+```
+
+### State merge
+
+```
+For incoming member M with incarnation I and state S:
+  If M not in local list: add, trigger onJoin callback
+  If M.incarnation > local.incarnation: update (higher incarnation wins)
+  If M.incarnation == local.incarnation:
+    If state_priority(M.state) > state_priority(local.state): update
+    Where priority: Dead(3) > Suspect(2) > Alive(1) > Left(0)
+  If M.incarnation < local.incarnation: ignore (stale)
+```
+
+## Policy engine
+
+Default-deny. Rules evaluated by priority descending, first match wins.
 
 ```yaml
 - name: operators-mesh-access
@@ -113,7 +302,173 @@ Default-deny. Rules evaluated by priority (descending), first match wins.
   effect: allow
 ```
 
-Enforcer parses IPv4 headers, looks up peer by IP, evaluates CEL program. Connection tracking with 5-minute TTL.
+### Evaluation path
+
+```
+IP packet arrives on WireGuard interface
+  |
+  v
+Parse IPv4 header -> extract src_ip, dst_ip, protocol, src_port, dst_port
+  |
+  v
+Lookup src_ip in peer cache -> {node_id, roles, compartment}
+Lookup dst_ip in peer cache -> {node_id, roles, compartment}
+  |
+  v
+Build Request{source_*, dest_*, protocol, direction}
+  |
+  v
+For each rule (sorted by priority desc):
+  Match subjects? (roles OR node_ids OR compartments, all fields AND'd)
+  Match resources? (nodes, ports, protocols, direction)
+  If condition set: evaluate CEL program with request variables
+  If all match: return rule.effect
+  |
+  v
+No match: return Deny (default)
+```
+
+CEL variables available: `source_node_id`, `source_roles`, `source_ip`, `dest_node_id`, `dest_roles`, `dest_ip`, `dest_port`, `protocol`, `direction`, `metadata`.
+
+## WireGuard integration
+
+### Custom conn.Bind
+
+WireGuard normally sends/receives UDP datagrams via `conn.Bind`. ghostwire replaces this with `HTTPSBind` that routes packets through the HTTPS transport:
+
+```
+WireGuard Send(packet, endpoint)
+  |
+  v
+HTTPSBind.Send:
+  Lock connsMu
+  Lookup endpoint in remoteConns map
+  If exists: reuse TLS connection
+  If not:
+    Unlock, dial new TLS connection:
+      TCP connect -> TLS 1.3 handshake -> knock POST -> read 101 response
+      Wrap in wsConn (WebSocket framing + length mask exchange)
+    Re-lock, double-check map (another goroutine may have connected)
+    Store connection, start receiveLoop goroutine
+  Write packet through wsConn -> WebSocket frame -> TLS -> TCP
+```
+
+```
+Incoming TLS connection
+  |
+  v
+HTTPSBind.handleIncoming:
+  Read HTTP request (buffered, waits for \r\n\r\n)
+  Validate knock (check replay cache)
+  If invalid: serve cover HTML page, close
+  If valid: send 101 WebSocket upgrade
+  Wrap in wsConn (read client's length mask)
+  Store in remoteConns, start receiveLoop
+  |
+  v
+receiveLoop:
+  Read WebSocket frame -> decode -> strip padding -> extract WG packet
+  Push to recvChan (buffered channel, capacity 256)
+  |
+  v
+WireGuard ReceiveFunc (registered during Open):
+  Block on <-recvChan
+  Return packet + endpoint to WireGuard
+```
+
+### Peer lifecycle
+
+```
+Node starts
+  |
+  v
+Gossip discovers peer (onJoin callback)
+  |
+  v
+Register peer's X25519 pubkey with knock validator (AddKnownClient)
+  |
+  v
+Create WireGuard peer via IPC:
+  public_key={hex}
+  allowed_ip={mesh_ip}/32
+  endpoint={underlay_ip}:8444           -- transport port, from gossip endpoint
+  persistent_keepalive_interval=25
+  |
+  v
+WireGuard initiates Noise IK handshake via HTTPSBind.Send
+  |
+  v
+Handshake completes -> encrypted session established
+  |
+  v
+IP traffic flows: App -> TUN -> WireGuard encrypt -> HTTPSBind -> WebSocket -> TLS -> TCP
+```
+
+## Post-quantum key exchange
+
+Hybrid X25519 + Kyber-768 (ML-KEM). Both must be broken to recover the shared secret.
+
+```
+Alice                                    Bob
+  |                                       |
+  | x25519_eph = random X25519 keypair    |
+  | kyber_eph = random Kyber-768 keypair  |
+  |                                       |
+  |--- x25519_eph.pub, kyber_eph.pub --->|
+  |                                       |
+  |    x25519_ss = X25519(bob_priv,       |
+  |                       alice_x25519_pub)|
+  |    kyber_ss, kyber_ct =               |
+  |      Kyber.Encapsulate(alice_kyber_pub)|
+  |                                       |
+  |<--- kyber_ct (1088 bytes) -----------|
+  |                                       |
+  | x25519_ss = X25519(alice_priv,        |
+  |                    bob_x25519_pub)     |
+  | kyber_ss = Kyber.Decapsulate(         |
+  |              kyber_ct, alice_kyber_priv)|
+  |                                       |
+  | shared = SHA-512(x25519_ss || kyber_ss)|  -- 64 bytes
+  |         = SHA-512(32 bytes || 32 bytes)|
+  |                                       |
+  | encryption_key = shared[0:32]         |  -- ChaCha20-Poly1305
+  | mac_key        = shared[32:64]        |
+```
+
+Security: 128-bit classical (X25519) + 128-bit post-quantum (Kyber-768). Combined via SHA-512 ensures the stronger primitive dominates.
+
+## NAT traversal
+
+```
+Node A (behind NAT)          Relay           Node B (behind NAT)
+  |                           |                |
+  | STUN query to             |                |
+  | stun.l.google.com:19302   |                |
+  |<-- external addr A' --    |                |
+  |                           |                |
+  |-- HolePunchReq{A', B'} ->|                |
+  |                           |-- forward ---->|
+  |                           |                |
+  |                           |                | STUN query
+  |                           |                |<-- external addr B'
+  |                           |                |
+  |<====== 5 UDP packets at 50ms intervals ======>|
+  |        (both sides simultaneously)             |
+  |                           |                |
+  |        NAT mapping created when outbound   |
+  |        packet matches inbound source       |
+  |                           |                |
+  |<========= direct WireGuard tunnel ========>|
+  |           (relay no longer needed)         |
+
+NAT classification:
+  Response from server 1: external = A1:P1
+  Response from server 2: external = A2:P2
+  If A1:P1 == local       -> NATNone (public IP)
+  If A1 == A2, P1 == P2   -> NATFull (full cone)
+  If A1 == A2, P1 != P2   -> NATRestricted (port-restricted)
+  If A1 != A2              -> NATSymmetric (not hole-punchable, use relay)
+```
 
 ## Roles
 
@@ -126,7 +481,7 @@ Enforcer parses IPv4 headers, looks up peer by IP, evaluates CEL program. Connec
 
 ## Config
 
-age encryption, scrypt KDF (N=2^18), ChaCha20-Poly1305. No magic bytes.
+age encryption, scrypt KDF (N=2^18, r=8, p=1), ChaCha20-Poly1305. No magic bytes.
 
 ```
 ~/.config/gw/
@@ -135,7 +490,7 @@ age encryption, scrypt KDF (N=2^18), ChaCha20-Poly1305. No magic bytes.
   ca.crt       # CA certificate
 ```
 
-Secure delete: random overwrite, zero overwrite, rename to random filename, unlink. Note: not effective on CoW filesystems (APFS, Btrfs).
+Secure delete: random overwrite, zero overwrite, rename to random filename, unlink. Not effective on CoW filesystems (APFS, Btrfs).
 
 ## Docker testing
 
@@ -144,11 +499,7 @@ docker compose -f docker-compose.test.yml build
 bash testdata/mesh-test/run-mesh-test.sh
 ```
 
-3 containers (admin, relay, operator). Tests: init, enroll, join, daemon start, WireGuard tunnel, mesh overlay ping, gossip discovery, network degradation (tc netem), panic wipe. GUI on ports 9901-9903.
-
-## Post-quantum
-
-Hybrid X25519 + Kyber-768. Combined secret: `SHA-512(X25519_SS || Kyber_SS)`. 64-byte output. Both algorithms must be broken to recover the key.
+3 containers (admin, relay, operator) on a bridge network. Tests init, enroll, join, daemon start, WireGuard tunnel, mesh overlay ping, gossip discovery, network degradation (tc netem 50ms latency + 5% loss), panic wipe. GUI on ports 9901-9903.
 
 ## Requirements
 
