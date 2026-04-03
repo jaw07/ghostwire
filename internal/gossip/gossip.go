@@ -64,18 +64,20 @@ const (
 	MsgSync
 	MsgSyncResp
 	MsgBroadcast
+	MsgChat
 )
 
 // Message is a gossip protocol message
 type Message struct {
-	Type      MessageType `json:"type"`
-	SeqNo     uint64      `json:"seq"`
-	From      string      `json:"from"`
-	Target    string      `json:"target,omitempty"`
-	Members   []*Member   `json:"members,omitempty"`
-	Digest    []byte      `json:"digest,omitempty"`
-	Timestamp int64       `json:"ts"`
-	HMAC      []byte      `json:"hmac,omitempty"`
+	Type      MessageType     `json:"type"`
+	SeqNo     uint64          `json:"seq"`
+	From      string          `json:"from"`
+	Target    string          `json:"target,omitempty"`
+	Members   []*Member       `json:"members,omitempty"`
+	Digest    []byte          `json:"digest,omitempty"`
+	Timestamp int64           `json:"ts"`
+	HMAC      []byte          `json:"hmac,omitempty"`
+	Payload   json.RawMessage `json:"payload,omitempty"`
 }
 
 // Gossip implements the SWIM gossip protocol
@@ -105,6 +107,10 @@ type Gossip struct {
 	// Replay deduplication: seen message hashes with expiry
 	seenMsgs   map[uint64]int64 // hash -> expiry unix nano
 	seenMsgsMu sync.Mutex
+
+	// Custom message handler
+	onCustomMessage    func(msgType MessageType, from string, payload []byte)
+	onCustomMessageMu  sync.RWMutex
 }
 
 type broadcastItem struct {
@@ -189,6 +195,41 @@ func (g *Gossip) Broadcast(members []*Member) {
 		Timestamp: time.Now().UnixNano(),
 	}
 
+	g.queueBroadcast(msg)
+}
+
+// BroadcastPayload queues a custom typed message with an arbitrary payload for
+// dissemination across the mesh.
+func (g *Gossip) BroadcastPayload(msgType MessageType, payload []byte) {
+	msg := &Message{
+		Type:      msgType,
+		From:      g.self.NodeID,
+		Payload:   json.RawMessage(payload),
+		Timestamp: time.Now().UnixNano(),
+	}
+
+	g.queueBroadcast(msg)
+}
+
+// SetCustomHandler registers a callback that is invoked whenever a custom
+// message (e.g. MsgChat) is received. It is safe to call concurrently.
+func (g *Gossip) SetCustomHandler(handler func(msgType MessageType, from string, payload []byte)) {
+	g.onCustomMessageMu.Lock()
+	defer g.onCustomMessageMu.Unlock()
+	g.onCustomMessage = handler
+}
+
+func (g *Gossip) handleCustomBroadcast(msg *Message) {
+	// Invoke handler if registered.
+	g.onCustomMessageMu.RLock()
+	h := g.onCustomMessage
+	g.onCustomMessageMu.RUnlock()
+
+	if h != nil {
+		h(msg.Type, msg.From, []byte(msg.Payload))
+	}
+
+	// Re-queue to propagate to other peers.
 	g.queueBroadcast(msg)
 }
 
@@ -285,6 +326,8 @@ func (g *Gossip) handleMessage(msg *Message, from net.Addr) {
 		g.handleSyncResp(msg)
 	case MsgBroadcast:
 		g.handleBroadcast(msg)
+	case MsgChat:
+		g.handleCustomBroadcast(msg)
 	}
 }
 
@@ -692,6 +735,7 @@ func (g *Gossip) hmacMessage(msg *Message) []byte {
 		mac.Write([]byte{byte(m.State)})
 		binary.Write(mac, binary.BigEndian, m.Incarnation)
 	}
+	mac.Write(msg.Payload)
 	return mac.Sum(nil)[:16]
 }
 

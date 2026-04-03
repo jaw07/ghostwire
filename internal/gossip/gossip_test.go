@@ -1,6 +1,7 @@
 package gossip
 
 import (
+	"encoding/json"
 	"net/netip"
 	"sync"
 	"testing"
@@ -871,6 +872,59 @@ func TestGetBroadcasts_LimitRespected(t *testing.T) {
 	msgs := g.getBroadcasts(2)
 	if len(msgs) != 2 {
 		t.Fatalf("getBroadcasts(2) returned %d, want 2", len(msgs))
+	}
+}
+
+// --- BroadcastPayload / MsgChat ---
+
+func TestBroadcastChat(t *testing.T) {
+	self := makeMember("node1", StateAlive, 1)
+	g, _ := New(DefaultConfig(), self)
+
+	payload := []byte(`{"text":"hello mesh"}`)
+	g.BroadcastPayload(MsgChat, payload)
+
+	msgs := g.getBroadcasts(10)
+	if len(msgs) != 1 {
+		t.Fatalf("getBroadcasts returned %d messages, want 1", len(msgs))
+	}
+
+	msg := msgs[0]
+	if msg.Type != MsgChat {
+		t.Fatalf("msg.Type = %v, want MsgChat (%v)", msg.Type, MsgChat)
+	}
+
+	var got map[string]string
+	if err := json.Unmarshal(msg.Payload, &got); err != nil {
+		t.Fatalf("failed to unmarshal payload: %v", err)
+	}
+	if got["text"] != "hello mesh" {
+		t.Fatalf("payload text = %q, want %q", got["text"], "hello mesh")
+	}
+}
+
+// --- HMAC covers Payload ---
+
+func TestHMAC_CoversPayload(t *testing.T) {
+	g := newGossipWithSecret([]byte("test-secret-key"))
+
+	msg := &Message{
+		Type:      MsgChat,
+		SeqNo:     1,
+		From:      "node1",
+		Timestamp: time.Now().UnixNano(),
+		Payload:   json.RawMessage(`{"text":"original"}`),
+	}
+	g.signHMAC(msg)
+
+	if !g.verifyHMAC(msg) {
+		t.Fatal("verifyHMAC should pass for freshly signed message")
+	}
+
+	// Tamper with the payload — verification must fail.
+	msg.Payload = json.RawMessage(`{"text":"tampered"}`)
+	if g.verifyHMAC(msg) {
+		t.Fatal("verifyHMAC should fail when Payload is tampered")
 	}
 }
 
