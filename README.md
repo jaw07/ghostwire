@@ -181,22 +181,26 @@ Step 5 prevents MITM: an attacker substituting a rogue CA would fail the fingerp
 ### Certificate renewal
 
 ```
-Node                                   Admin
-  |                                      |
-  |  nonce = random(16 bytes)            |
-  |  sig = Sign(node_key,               |
-  |    "node_id:cert_hash:nonce:ts")    |
-  |                                      |
-  |---- POST /renew {node_id, --------->|
-  |      cert_hash, nonce, ts, sig}     |
-  |                                      |
-  |      Verify sig against registered   |
-  |      key (not request key)           |
-  |      Verify cert_hash matches        |
-  |      Reject replayed nonce           |
-  |      Preserve roles from current cert|
-  |                                      |
-  |<---- {new_cert, expires_at} ---------|
+Node                                          Admin
+  |                                             |
+  |  nonce = random(16 bytes)                   |
+  |  sig = Sign(node_key,                      |
+  |          "node_id:cert_hash:nonce:ts")     |
+  |                                             |
+  |-- POST /renew --------------------------->  |
+  |   {node_id, cert_hash, nonce, ts, sig}      |
+  |                                             |
+  |                          Verify sig against  |
+  |                          registered key      |
+  |                          (not request key)   |
+  |                          Verify cert_hash    |
+  |                          Reject replayed     |
+  |                          nonce               |
+  |                          Preserve roles      |
+  |                          from current cert   |
+  |                                             |
+  |  <-- {new_cert, expires_at} --------------  |
+  |                                             |
 ```
 
 ## Key derivation
@@ -456,38 +460,47 @@ Security: 128-bit classical (X25519) + 128-bit post-quantum (Kyber-768). Combine
 ## NAT traversal
 
 ```
-Node A (behind NAT)           Relay            Node B (behind NAT)
-  |                             |                |
-  |  STUN query to              |                |
-  |  stun.l.google.com:19302    |                |
-  |<-- external addr A' --------|                |
-  |                             |                |
-  |--- HolePunchReq{A', B'} -->|                |
-  |                             |--- forward --->|
-  |                             |                |
-  |                             |  STUN query    |
-  |                             |                |<-- external addr B'
-  |                             |                |
-  |<======= 5 UDP packets at 50ms intervals ======>|
-  |          (both sides simultaneously)            |
-  |                             |                |
-  |          NAT mapping opens when outbound     |
-  |          packet matches inbound source       |
-  |                             |                |
-  |<=========== direct WireGuard tunnel ========>|
-  |             (relay no longer needed)         |
+Node A                    Relay                    Node B
+(behind NAT)                                       (behind NAT)
+  |                         |                         |
+  |  STUN query             |                         |
+  |  stun.l.google.com      |                         |
+  |  :19302                 |                         |
+  |<-- external addr A' --- |                         |
+  |                         |                         |
+  |-- HolePunchReq -------> |                         |
+  |   {A', B'}              |                         |
+  |                         |-- forward ------------>>|
+  |                         |                         |
+  |                         |            STUN query   |
+  |                         |                         |
+  |                         |   external addr B' -->> |
+  |                         |                         |
+  |<<===== 5 UDP packets at 50ms intervals =======>>>>>|
+  |        (both sides send simultaneously)            |
+  |                         |                         |
+  |  NAT mapping opens:     |                         |
+  |  outbound pkt matches   |                         |
+  |  inbound source addr    |                         |
+  |                         |                         |
+  |<<========= direct WireGuard tunnel ===========>>>>>|
+  |            relay no longer needed                  |
+  |                         |                         |
 ```
 
 NAT classification via STUN:
 
 ```
-Response from server 1: external = A1:P1
-Response from server 2: external = A2:P2
-
-A1:P1 == local         -> NATNone       (public IP)
-A1 == A2 && P1 == P2   -> NATFull       (full cone)
-A1 == A2 && P1 != P2   -> NATRestricted (port-restricted)
-A1 != A2               -> NATSymmetric  (not hole-punchable, use relay)
++----------------------------+------------------------------------------+
+| Condition                  | Classification                           |
++----------------------------+------------------------------------------+
+| A1:P1 == local addr        | NATNone       - public IP, no NAT       |
+| A1 == A2 and P1 == P2      | NATFull       - full cone               |
+| A1 == A2 and P1 != P2      | NATRestricted - port-restricted cone    |
+| A1 != A2                   | NATSymmetric  - not hole-punchable      |
++----------------------------+------------------------------------------+
+A1:P1 = external addr from STUN server 1
+A2:P2 = external addr from STUN server 2
 ```
 
 ## Roles
