@@ -497,6 +497,77 @@ A1:P1 = external addr from STUN server 1
 A2:P2 = external addr from STUN server 2
 ```
 
+## Chat
+
+Encrypted mesh chat between nodes. Messages broadcast via gossip, displayed in the GUI in real-time via WebSocket.
+
+```
+Node A (GUI)                    Gossip                    Node B (GUI)
+  |                               |                          |
+  |  User types message            |                         |
+  |-- POST /api/chat ------------>|                          |
+  |                               |                          |
+  |  ChatService.Send()            |                         |
+  |  OnSend callback:              |                         |
+  |    json.Marshal(ChatMessage)   |                         |
+  |    gossip.BroadcastPayload(    |                         |
+  |      MsgChat, payload)         |                         |
+  |                               |                          |
+  |    UDP send to all alive ----->|--- UDP to Node B ------>|
+  |    members directly            |                         |
+  |                               |   verifyHMAC (covers     |
+  |                               |     Payload field)       |
+  |                               |   handleCustomBroadcast  |
+  |                               |   ChatService.Receive()  |
+  |                               |   OnReceive callback:    |
+  |                               |     BroadcastChat() ---->|  WebSocket push
+  |                               |                          |  updateChat(msg)
+  |                               |                          |
+```
+
+Chat messages are HMAC-authenticated (the `Payload` field is included in the gossip HMAC computation) and replay-deduplicated. History capped at 200 messages per node.
+
+API:
+- `GET /api/chat?token=` — message history
+- `POST /api/chat?token=` — send `{"text":"..."}`
+- WebSocket type `"chat"` — real-time push `{sender, text, timestamp}`
+
+## MAVLink proxy
+
+UDP proxy for MAVLink drone telemetry. Listens on port 14550, forwards packets through the encrypted mesh tunnel.
+
+```
+Ground Control          Node A              WireGuard           Node B              Autopilot
+(QGroundControl)        (MAVLink proxy)     Mesh Tunnel         (MAVLink proxy)     (Pixhawk)
+  |                       |                   |                   |                   |
+  |-- MAVLink UDP ------->| :14550            |                   |                   |
+  |   (HEARTBEAT,         |                   |                   |                   |
+  |    COMMAND_LONG, etc)  |  Parse header:    |                   |                   |
+  |                       |  sysid, msgid     |                   |                   |
+  |                       |  OnPacket callback |                   |                   |
+  |                       |                   |                   |                   |
+  |                       |  Packet goes       |                   |                   |
+  |                       |  through TUN/gw0 ->| WG encrypt ------>| TUN/gw0 -------->|
+  |                       |                   |  (HTTPS-mimic      |                   |
+  |                       |                   |   WebSocket frames) |                   |
+  |                       |                   |                   |  UDP forward ----->|
+  |                       |                   |                   |  to local          |
+  |                       |                   |                   |  autopilot         |
+  |                       |                   |                   |                   |
+  |<-- telemetry ---------|<------------------|<------------------|<-- MAVLink UDP ----|
+  |   (ATTITUDE,          |  Deliver()         |                   |                   |
+  |    GPS_RAW_INT, etc)  |                   |                   |                   |
+```
+
+Packet parser extracts MAVLink v1 (0xFE) and v2 (0xFD) headers:
+
+```
+MAVLink v1:  [FE][len][seq][sysid][compid][msgid][payload][crc]
+MAVLink v2:  [FD][len][incompat][compat][seq][sysid][compid][msgid:3][payload][crc]
+```
+
+Connect a GCS to any mesh node's port 14550. MAVLink traffic routes through the encrypted WireGuard tunnel to drones on other nodes. System IDs 1-200 are drones, 200-255 are ground stations.
+
 ## Roles
 
 | Role | Access |
