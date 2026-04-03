@@ -8,12 +8,20 @@ import (
 	"time"
 )
 
+// ChatMsg represents a chat message
+type ChatMsg struct {
+	Sender    string `json:"sender"`
+	Text      string `json:"text"`
+	Timestamp int64  `json:"timestamp"`
+}
+
 // API handles REST API requests
 type API struct {
-	server *Server
-	mu     sync.RWMutex
-	status *Status
-	peers  []*Peer
+	server   *Server
+	mu       sync.RWMutex
+	status   *Status
+	peers    []*Peer
+	chatMsgs []ChatMsg
 }
 
 // Status represents the mesh status
@@ -46,9 +54,10 @@ type Peer struct {
 // NewAPI creates a new API handler
 func NewAPI(server *Server) *API {
 	return &API{
-		server: server,
-		status: &Status{},
-		peers:  make([]*Peer, 0),
+		server:   server,
+		status:   &Status{},
+		peers:    make([]*Peer, 0),
+		chatMsgs: make([]ChatMsg, 0),
 	}
 }
 
@@ -68,6 +77,10 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.handleDisconnect(w, r)
 	case path == "/stats" && r.Method == "GET":
 		a.handleGetStats(w, r)
+	case path == "/chat" && r.Method == "GET":
+		a.handleGetChat(w, r)
+	case path == "/chat" && r.Method == "POST":
+		a.handlePostChat(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -127,6 +140,42 @@ func (a *API) handleGetStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.writeJSON(w, stats)
+}
+
+// handleGetChat returns the chat message history
+func (a *API) handleGetChat(w http.ResponseWriter, r *http.Request) {
+	a.mu.RLock()
+	msgs := a.chatMsgs
+	a.mu.RUnlock()
+
+	a.writeJSON(w, msgs)
+}
+
+// handlePostChat receives a new chat message from the client
+func (a *API) handlePostChat(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		a.writeError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	if a.server != nil && a.server.onChatSend != nil {
+		a.server.onChatSend(req.Text)
+	}
+
+	a.writeJSON(w, map[string]string{"status": "sent"})
+}
+
+// AddChatMessage appends a chat message, capped at 200 entries
+func (a *API) AddChatMessage(msg ChatMsg) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.chatMsgs = append(a.chatMsgs, msg)
+	if len(a.chatMsgs) > 200 {
+		a.chatMsgs = a.chatMsgs[len(a.chatMsgs)-200:]
+	}
 }
 
 // SetStatus updates the status

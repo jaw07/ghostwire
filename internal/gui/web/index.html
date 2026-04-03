@@ -52,6 +52,20 @@
         #error { color: #f87171; padding: 10px; background: #3b1818; border-radius: 6px; margin-top: 10px; display: none; }
         .loading { opacity: 0.5; pointer-events: none; }
         footer { margin-top: 40px; padding: 20px 0; border-top: 1px solid #222; text-align: center; color: #666; font-size: 13px; }
+        .chat-messages {
+            height: 250px; overflow-y: auto; background: #0a0a0a; border-radius: 6px;
+            padding: 10px; margin-bottom: 10px; display: flex; flex-direction: column; gap: 6px;
+        }
+        .chat-msg { font-size: 13px; line-height: 1.4; }
+        .chat-msg .chat-time { color: #555; margin-right: 6px; }
+        .chat-msg .chat-sender { color: #3b82f6; font-weight: 500; margin-right: 4px; }
+        .chat-msg .chat-text { color: #e0e0e0; }
+        .chat-input-row { display: flex; gap: 8px; }
+        .chat-input-row input {
+            flex: 1; background: #0a0a0a; border: 1px solid #333; border-radius: 6px;
+            padding: 8px 12px; color: #e0e0e0; font-size: 14px; outline: none;
+        }
+        .chat-input-row input:focus { border-color: #3b82f6; }
     </style>
 </head>
 <body>
@@ -104,6 +118,15 @@
             <ul class="peers-list" id="peers-list">
                 <li class="peer" style="color: #666; justify-content: center;">No peers connected</li>
             </ul>
+        </div>
+
+        <div class="card" style="margin-top: 20px;">
+            <h2>Chat</h2>
+            <div class="chat-messages" id="chat-messages"></div>
+            <div class="chat-input-row">
+                <input type="text" id="chat-input" placeholder="Type a message..." />
+                <button class="btn btn-primary" onclick="sendChat()">Send</button>
+            </div>
         </div>
 
         <div class="actions">
@@ -226,6 +249,7 @@
                         const msg = JSON.parse(line);
                         if (msg.type === 'status') updateStatus(msg.data);
                         if (msg.type === 'peers') updatePeers(msg.data);
+                        if (msg.type === 'chat') updateChat(msg.data);
                     }
                 } catch (e) {
                     console.error('Failed to parse message:', e);
@@ -252,9 +276,56 @@
             }
         };
 
+        function updateChat(msg) {
+            const container = document.getElementById('chat-messages');
+            const time = new Date(msg.timestamp * 1000).toLocaleTimeString();
+            const sender = (msg.sender || '').replace(/</g, '&lt;');
+            const text = (msg.text || '').replace(/</g, '&lt;');
+            const el = document.createElement('div');
+            el.className = 'chat-msg';
+            el.innerHTML = `<span class="chat-time">${time}</span><span class="chat-sender">${sender}</span><span class="chat-text">${text}</span>`;
+            container.appendChild(el);
+            container.scrollTop = container.scrollHeight;
+        }
+
+        async function sendChat() {
+            const input = document.getElementById('chat-input');
+            const text = input.value.trim();
+            if (!text) return;
+            try {
+                await fetch('/api/chat?token=' + token, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text })
+                });
+                input.value = '';
+            } catch (e) {
+                console.error('Failed to send chat:', e);
+            }
+        }
+
+        document.getElementById('chat-input').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') sendChat();
+        });
+
+        async function fetchChat() {
+            try {
+                const res = await fetch('/api/chat?token=' + token);
+                if (res.ok) {
+                    const msgs = await res.json();
+                    const container = document.getElementById('chat-messages');
+                    container.innerHTML = '';
+                    (msgs || []).forEach(updateChat);
+                }
+            } catch (e) {
+                console.error('Failed to fetch chat:', e);
+            }
+        }
+
         // Initial fetch
         fetchStatus();
         fetchPeers();
+        fetchChat();
 
         // Connect WebSocket for real-time updates
         connectWebSocket();

@@ -20,14 +20,15 @@ var webAssets embed.FS
 
 // Server is the GUI HTTP server
 type Server struct {
-	mu         sync.RWMutex
-	config     *Config
-	httpServer *http.Server
-	listener   net.Listener
-	api        *API
-	wsHub      *Hub
-	authToken  string
-	running    bool
+	mu           sync.RWMutex
+	config       *Config
+	httpServer   *http.Server
+	listener     net.Listener
+	api          *API
+	wsHub        *Hub
+	authToken    string
+	running      bool
+	onChatSend   func(text string)
 }
 
 // Config configures the GUI server
@@ -230,6 +231,24 @@ func (s *Server) openBrowser() {
 	}
 
 	cmd.Start()
+}
+
+// SetChatHandler sets the callback invoked when a client sends a chat message
+func (s *Server) SetChatHandler(handler func(text string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onChatSend = handler
+}
+
+// BroadcastChat adds a chat message to history and broadcasts it to all clients
+func (s *Server) BroadcastChat(sender, text string, timestamp int64) {
+	msg := ChatMsg{
+		Sender:    sender,
+		Text:      text,
+		Timestamp: timestamp,
+	}
+	s.api.AddChatMessage(msg)
+	s.Broadcast("chat", msg)
 }
 
 // SetStatus updates the mesh status and broadcasts to clients
