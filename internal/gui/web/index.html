@@ -130,19 +130,39 @@
         </div>
 
         <div class="card" style="margin-top: 20px;">
-            <h2>MAVLink Links</h2>
+            <h2>MAVLink</h2>
             <div id="mavlink-links" style="margin-bottom: 12px;"></div>
-            <details style="margin-top: 8px;">
-                <summary style="cursor: pointer; color: #3b82f6; font-size: 14px; font-weight: 500; outline: none;">New Link</summary>
-                <div style="margin-top: 12px; display: flex; flex-direction: column; gap: 8px;">
-                    <input type="text" id="mavlink-name" placeholder="Link name" style="background: #0a0a0a; border: 1px solid #333; border-radius: 6px; padding: 8px 12px; color: #e0e0e0; font-size: 14px; outline: none;" />
-                    <select id="mavlink-protocol" style="background: #0a0a0a; border: 1px solid #333; border-radius: 6px; padding: 8px 12px; color: #e0e0e0; font-size: 14px; outline: none;">
-                        <option value="tcp">TCP</option>
-                        <option value="udp">UDP</option>
-                    </select>
-                    <input type="text" id="mavlink-listen" placeholder="Listen address" value="0.0.0.0:14550" style="background: #0a0a0a; border: 1px solid #333; border-radius: 6px; padding: 8px 12px; color: #e0e0e0; font-size: 14px; outline: none;" />
-                    <input type="text" id="mavlink-target" placeholder="Target address" style="background: #0a0a0a; border: 1px solid #333; border-radius: 6px; padding: 8px 12px; color: #e0e0e0; font-size: 14px; outline: none;" />
-                    <button class="btn btn-primary" onclick="createMAVLink()" style="align-self: flex-start;">Create</button>
+            <details id="mavlink-form" style="margin-top: 8px;">
+                <summary style="cursor: pointer; color: #3b82f6; font-size: 14px; font-weight: 500; outline: none;">+ Connect to Flight Controller</summary>
+                <div style="margin-top: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+                    <div style="grid-column: 1 / -1;">
+                        <label style="font-size: 12px; color: #666; display: block; margin-bottom: 4px;">Drone Node</label>
+                        <select id="mav-drone-node" style="width: 100%; background: #0a0a0a; border: 1px solid #333; border-radius: 6px; padding: 8px 12px; color: #e0e0e0; font-size: 14px; outline: none;">
+                            <option value="">Select node with flight controller...</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label style="font-size: 12px; color: #666; display: block; margin-bottom: 4px;">FC Port</label>
+                        <input type="text" id="mav-fc-port" value="5760" placeholder="5760" style="width: 100%; background: #0a0a0a; border: 1px solid #333; border-radius: 6px; padding: 8px 12px; color: #e0e0e0; font-size: 14px; outline: none; box-sizing: border-box;" />
+                    </div>
+                    <div>
+                        <label style="font-size: 12px; color: #666; display: block; margin-bottom: 4px;">Protocol</label>
+                        <select id="mav-protocol" style="width: 100%; background: #0a0a0a; border: 1px solid #333; border-radius: 6px; padding: 8px 12px; color: #e0e0e0; font-size: 14px; outline: none;">
+                            <option value="tcp">TCP</option>
+                            <option value="udp">UDP</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label style="font-size: 12px; color: #666; display: block; margin-bottom: 4px;">GCS Listen Port</label>
+                        <input type="text" id="mav-gcs-port" value="14550" placeholder="14550" style="width: 100%; background: #0a0a0a; border: 1px solid #333; border-radius: 6px; padding: 8px 12px; color: #e0e0e0; font-size: 14px; outline: none; box-sizing: border-box;" />
+                    </div>
+                    <div style="grid-column: 1 / -1;">
+                        <label style="font-size: 12px; color: #666; display: block; margin-bottom: 4px;">Connection Name</label>
+                        <input type="text" id="mav-name" placeholder="e.g. drone-1" style="width: 100%; background: #0a0a0a; border: 1px solid #333; border-radius: 6px; padding: 8px 12px; color: #e0e0e0; font-size: 14px; outline: none; box-sizing: border-box;" />
+                    </div>
+                    <div style="grid-column: 1 / -1;">
+                        <button class="btn btn-primary" onclick="createMAVLink()" style="width: 100%;">Connect</button>
+                    </div>
                 </div>
             </details>
         </div>
@@ -208,6 +228,8 @@
             const list = document.getElementById('peers-list');
             if (!peers || peers.length === 0) {
                 list.innerHTML = '<li class="peer" style="color: #666; justify-content: center;">No peers connected</li>';
+                knownPeers = [];
+                updateMAVLinkPeerDropdown();
                 return;
             }
 
@@ -220,6 +242,10 @@
                     <div class="peer-status ${peer.connected ? 'online' : 'offline'}"></div>
                 </li>
             `).join('');
+
+            // Update MAVLink peer dropdown
+            knownPeers = peers;
+            updateMAVLinkPeerDropdown();
         }
 
         function showError(msg) {
@@ -341,48 +367,85 @@
             }
         }
 
+        // -- MAVLink --
+
+        let knownPeers = []; // cached from updatePeers
+
+        function updateMAVLinkPeerDropdown() {
+            const sel = document.getElementById('mav-drone-node');
+            const prev = sel.value;
+            sel.innerHTML = '<option value="">Select node with flight controller...</option>';
+            knownPeers.forEach(p => {
+                const opt = document.createElement('option');
+                opt.value = p.mesh_ip;
+                opt.textContent = p.node_id + ' (' + p.mesh_ip + ')';
+                sel.appendChild(opt);
+            });
+            if (prev) sel.value = prev;
+        }
+
         function updateMAVLinkLinks(links) {
             const container = document.getElementById('mavlink-links');
             if (!links || links.length === 0) {
-                container.innerHTML = '<div style="color: #666; font-size: 13px; padding: 8px;">No MAVLink links configured</div>';
+                container.innerHTML = '<div style="color: #666; font-size: 13px; padding: 8px;">No active connections</div>';
                 return;
             }
             container.innerHTML = links.map(link => {
-                const connected = link.connected || false;
-                const statusColor = connected ? '#4ade80' : '#666';
-                const up = link.bytes_sent || 0;
-                const down = link.bytes_recv || 0;
-                return `<div style="display: flex; justify-content: space-between; align-items: center; padding: 12px; margin-bottom: 8px; background: #0a0a0a; border-radius: 6px;">
+                const isConn = link.status === 'connected' || (link.active_conns || 0) > 0;
+                const statusColor = isConn ? '#4ade80' : '#888';
+                const statusText = isConn ? 'connected' : 'listening';
+                return `<div style="display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; margin-bottom: 6px; background: #0a0a0a; border-radius: 6px;">
                     <div style="flex: 1;">
-                        <div style="font-weight: 500; color: #fff;">${(link.name || '').replace(/</g, '&lt;')}</div>
-                        <div style="font-size: 13px; color: #666; font-family: monospace;">${(link.protocol || '').toUpperCase()} ${link.listen_addr || ''} → ${link.target_addr || ''}</div>
-                        <div style="font-size: 12px; color: #555; margin-top: 2px;">↑ ${formatBytes(up)} ↓ ${formatBytes(down)}</div>
+                        <div><span style="font-weight: 500; color: #fff;">${(link.name || '').replace(/</g, '&lt;')}</span>
+                        <span style="color: #555; font-size: 12px; margin-left: 8px;">${(link.protocol || '').toUpperCase()}</span></div>
+                        <div style="font-size: 12px; color: #666; font-family: monospace; margin-top: 2px;">
+                            GCS :${(link.listen_addr||'').split(':').pop()} → ${link.target_addr || ''}
+                        </div>
                     </div>
-                    <div style="display: flex; align-items: center; gap: 12px;">
-                        <div style="width: 8px; height: 8px; border-radius: 50%; background: ${statusColor};"></div>
-                        <button onclick="deleteMAVLink('${(link.name || '').replace(/'/g, "\\'")}')" style="background: none; border: none; color: #dc2626; cursor: pointer; font-size: 16px; padding: 4px;">✕</button>
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <span style="font-size: 11px; color: #555;">↑${formatBytes(link.bytes_sent||0)} ↓${formatBytes(link.bytes_recv||0)}</span>
+                        <div style="width: 8px; height: 8px; border-radius: 50%; background: ${statusColor};" title="${statusText}"></div>
+                        <button onclick="deleteMAVLink('${(link.name||'').replace(/'/g,"\\'")}')"
+                            style="background:none;border:none;color:#dc2626;cursor:pointer;font-size:14px;padding:2px 4px;">✕</button>
                     </div>
                 </div>`;
             }).join('');
         }
 
         async function createMAVLink() {
-            const name = document.getElementById('mavlink-name').value.trim();
-            const protocol = document.getElementById('mavlink-protocol').value;
-            const listen = document.getElementById('mavlink-listen').value.trim();
-            const target = document.getElementById('mavlink-target').value.trim();
-            if (!name || !listen || !target) return;
+            const nodeIP = document.getElementById('mav-drone-node').value;
+            const fcPort = document.getElementById('mav-fc-port').value.trim() || '5760';
+            const protocol = document.getElementById('mav-protocol').value;
+            const gcsPort = document.getElementById('mav-gcs-port').value.trim() || '14550';
+            let name = document.getElementById('mav-name').value.trim();
+
+            if (!nodeIP) { showError('Select a drone node'); return; }
+
+            // Auto-generate name if empty
+            if (!name) {
+                const nodeName = document.querySelector('#mav-drone-node option:checked').textContent.split(' ')[0];
+                name = nodeName + '-fc';
+            }
+
+            const target = nodeIP + ':' + fcPort;
+            const listen = '0.0.0.0:' + gcsPort;
+
             try {
-                await fetch('/api/mavlink/links?token=' + token, {
+                const res = await fetch('/api/mavlink/links?token=' + token, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ name, protocol, listen_addr: listen, target_addr: target })
                 });
-                document.getElementById('mavlink-name').value = '';
-                document.getElementById('mavlink-target').value = '';
+                if (!res.ok) {
+                    const e = await res.json();
+                    showError(e.error || 'Failed to create link');
+                    return;
+                }
+                document.getElementById('mav-name').value = '';
+                document.getElementById('mavlink-form').removeAttribute('open');
                 fetchMAVLinkLinks();
             } catch (e) {
-                console.error('Failed to create MAVLink link:', e);
+                showError('Failed: ' + e.message);
             }
         }
 
@@ -398,12 +461,8 @@
         async function fetchMAVLinkLinks() {
             try {
                 const res = await fetch('/api/mavlink/links?token=' + token);
-                if (res.ok) {
-                    updateMAVLinkLinks(await res.json());
-                }
-            } catch (e) {
-                console.error('Failed to fetch MAVLink links:', e);
-            }
+                if (res.ok) updateMAVLinkLinks(await res.json());
+            } catch (e) {}
         }
 
         // Initial fetch
