@@ -532,45 +532,75 @@ API:
 - `POST /api/chat?token=` — send `{"text":"..."}`
 - WebSocket type `"chat"` — real-time push `{sender, text, timestamp}`
 
-## MAVLink proxy
+## MAVLink port forwarder
 
-UDP proxy for MAVLink drone telemetry. Listens on port 14550, forwards packets through the encrypted mesh tunnel.
-
-```
-GCS (QGroundControl)                              Autopilot (Pixhawk)
-  |                                                 |
-  |-- MAVLink UDP -->  Node A :14550                |
-  |   HEARTBEAT        |                            |
-  |   COMMAND_LONG     |  parse sysid, msgid        |
-  |                    |  OnPacket callback         |
-  |                    |                            |
-  |                    +-- TUN/gw0 interface        |
-  |                    |                            |
-  |                    |   WireGuard encrypt        |
-  |                    |   HTTPS-mimic transport    |
-  |                    |   WebSocket frames         |
-  |                    |                            |
-  |                    +===== encrypted mesh =====>  Node B :14550
-  |                                                 |
-  |                                                 |  Deliver() to
-  |                                                 |  local autopilot
-  |                                                 |
-  |                              encrypted mesh  <==+
-  |                                                 |
-  |  <-- telemetry --  Node A                       |
-  |      ATTITUDE      |  Deliver()                 |
-  |      GPS_RAW_INT   |                            |
-  |                                                 |
-```
-
-Packet parser extracts MAVLink v1 (0xFE) and v2 (0xFD) headers:
+Configurable TCP/UDP port forwarder for connecting a ground control station (GCS) to a flight controller (FC) on another mesh node. Managed via the GUI or REST API. No configuration needed on the FC node — the mesh tunnel makes it reachable.
 
 ```
-MAVLink v1:  [FE][len][seq][sysid][compid][msgid][payload][crc]
+GCS Node                        Mesh                        FC Node
+  |                               |                           |
+  |  QGroundControl               |                           |  ArduPilot / PX4
+  |  connects to                  |                           |  listening on
+  |  localhost:14550              |                           |  :5760
+  |       |                       |                           |
+  |       v                       |                           |
+  |  Forwarder link               |                           |
+  |  (TCP or UDP)                 |                           |
+  |       |                       |                           |
+  |       +-- TUN/gw0 ---------->| WireGuard encrypt ------->|
+  |                               | HTTPS-mimic transport     |
+  |                               | WebSocket frames          |
+  |                               |                           |
+  |                               |             TCP/UDP dial  |
+  |                               |             mesh_ip:5760  |
+  |                               |                     |     |
+  |                               |                     v     |
+  |                               |              Flight Controller
+  |                               |                           |
+  |       <-- telemetry ----------|<-- WireGuard decrypt <----|
+  |       ATTITUDE, GPS, etc      |                           |
+```
+
+### Setup
+
+From the GUI on the GCS node:
+1. Open MAVLink panel → "+ Connect to Flight Controller"
+2. Select the drone node from the dropdown (populated from gossip peers)
+3. Set FC port (default 5760), protocol (TCP/UDP), GCS listen port (default 14550)
+4. Click Connect
+
+Or via API:
+
+```bash
+# Create link
+curl -X POST "http://localhost:9999/api/mavlink/links?token=..." \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"drone-1","protocol":"tcp","listen_addr":"0.0.0.0:14550","target_addr":"10.99.0.2:5760"}'
+
+# List active links
+curl "http://localhost:9999/api/mavlink/links?token=..."
+
+# Remove link
+curl -X DELETE "http://localhost:9999/api/mavlink/links?token=...&name=drone-1"
+```
+
+### Link types
+
+| Protocol | Use case | How it works |
+|----------|----------|-------------|
+| TCP | ArduPilot SITL, most FC connections | Accept on listen, dial target, bidirectional `io.Copy` |
+| UDP | MAVLink UDP broadcast, some FC configs | Listen for datagrams, forward to target, return path tracked |
+
+### Packet parser
+
+Extracts headers from MAVLink v1 and v2 packets for logging and routing:
+
+```
+MAVLink v1:  [FE][len][seq][sysid][compid][msgid:1][payload][crc]
 MAVLink v2:  [FD][len][incompat][compat][seq][sysid][compid][msgid:3][payload][crc]
 ```
 
-Connect a GCS to any mesh node's port 14550. MAVLink traffic routes through the encrypted WireGuard tunnel to drones on other nodes. System IDs 1-200 are drones, 200-255 are ground stations.
+System IDs: 1-200 drones, 200-254 ground stations, 255 default GCS.
 
 ## Roles
 
