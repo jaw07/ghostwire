@@ -547,7 +547,7 @@ GCS Node                        Mesh                        FC Node
   |  Forwarder link               |                           |
   |  (TCP or UDP)                 |                           |
   |       |                       |                           |
-  |       +-- TUN/gw0 ---------->| WireGuard encrypt ------->|
+  |       +-- TUN/gw0 ----------> | WireGuard encrypt ------->|
   |                               | HTTPS-mimic transport     |
   |                               | WebSocket frames          |
   |                               |                           |
