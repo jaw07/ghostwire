@@ -17,11 +17,12 @@ type ChatMsg struct {
 
 // API handles REST API requests
 type API struct {
-	server   *Server
-	mu       sync.RWMutex
-	status   *Status
-	peers    []*Peer
-	chatMsgs []ChatMsg
+	server       *Server
+	mu           sync.RWMutex
+	status       *Status
+	peers        []*Peer
+	chatMsgs     []ChatMsg
+	mavlinkLinks []map[string]interface{}
 }
 
 // Status represents the mesh status
@@ -54,10 +55,11 @@ type Peer struct {
 // NewAPI creates a new API handler
 func NewAPI(server *Server) *API {
 	return &API{
-		server:   server,
-		status:   &Status{},
-		peers:    make([]*Peer, 0),
-		chatMsgs: make([]ChatMsg, 0),
+		server:       server,
+		status:       &Status{},
+		peers:        make([]*Peer, 0),
+		chatMsgs:     make([]ChatMsg, 0),
+		mavlinkLinks: make([]map[string]interface{}, 0),
 	}
 }
 
@@ -81,6 +83,12 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.handleGetChat(w, r)
 	case path == "/chat" && r.Method == "POST":
 		a.handlePostChat(w, r)
+	case path == "/mavlink/links" && r.Method == "GET":
+		a.handleGetMAVLinkLinks(w, r)
+	case path == "/mavlink/links" && r.Method == "POST":
+		a.handleCreateMAVLinkLink(w, r)
+	case path == "/mavlink/links" && r.Method == "DELETE":
+		a.handleDeleteMAVLinkLink(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -190,6 +198,63 @@ func (a *API) SetPeers(peers []*Peer) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.peers = peers
+}
+
+// handleGetMAVLinkLinks returns the list of MAVLink links
+func (a *API) handleGetMAVLinkLinks(w http.ResponseWriter, r *http.Request) {
+	a.mu.RLock()
+	links := a.mavlinkLinks
+	a.mu.RUnlock()
+
+	a.writeJSON(w, links)
+}
+
+// handleCreateMAVLinkLink creates a new MAVLink link
+func (a *API) handleCreateMAVLinkLink(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name       string `json:"name"`
+		Protocol   string `json:"protocol"`
+		ListenAddr string `json:"listen_addr"`
+		TargetAddr string `json:"target_addr"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		a.writeError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	if a.server != nil && a.server.onMAVLinkCreate != nil {
+		if err := a.server.onMAVLinkCreate(req.Name, req.Protocol, req.ListenAddr, req.TargetAddr); err != nil {
+			a.writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+
+	a.writeJSON(w, map[string]string{"status": "created"})
+}
+
+// handleDeleteMAVLinkLink removes a MAVLink link by name
+func (a *API) handleDeleteMAVLinkLink(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		a.writeError(w, http.StatusBadRequest, "Missing name parameter")
+		return
+	}
+
+	if a.server != nil && a.server.onMAVLinkDelete != nil {
+		if err := a.server.onMAVLinkDelete(name); err != nil {
+			a.writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+
+	a.writeJSON(w, map[string]string{"status": "removed"})
+}
+
+// SetMAVLinkLinks updates the stored MAVLink links
+func (a *API) SetMAVLinkLinks(links []map[string]interface{}) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.mavlinkLinks = links
 }
 
 // writeJSON writes a JSON response

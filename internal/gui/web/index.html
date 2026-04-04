@@ -129,6 +129,24 @@
             </div>
         </div>
 
+        <div class="card" style="margin-top: 20px;">
+            <h2>MAVLink Links</h2>
+            <div id="mavlink-links" style="margin-bottom: 12px;"></div>
+            <details style="margin-top: 8px;">
+                <summary style="cursor: pointer; color: #3b82f6; font-size: 14px; font-weight: 500; outline: none;">New Link</summary>
+                <div style="margin-top: 12px; display: flex; flex-direction: column; gap: 8px;">
+                    <input type="text" id="mavlink-name" placeholder="Link name" style="background: #0a0a0a; border: 1px solid #333; border-radius: 6px; padding: 8px 12px; color: #e0e0e0; font-size: 14px; outline: none;" />
+                    <select id="mavlink-protocol" style="background: #0a0a0a; border: 1px solid #333; border-radius: 6px; padding: 8px 12px; color: #e0e0e0; font-size: 14px; outline: none;">
+                        <option value="tcp">TCP</option>
+                        <option value="udp">UDP</option>
+                    </select>
+                    <input type="text" id="mavlink-listen" placeholder="Listen address" value="0.0.0.0:14550" style="background: #0a0a0a; border: 1px solid #333; border-radius: 6px; padding: 8px 12px; color: #e0e0e0; font-size: 14px; outline: none;" />
+                    <input type="text" id="mavlink-target" placeholder="Target address" style="background: #0a0a0a; border: 1px solid #333; border-radius: 6px; padding: 8px 12px; color: #e0e0e0; font-size: 14px; outline: none;" />
+                    <button class="btn btn-primary" onclick="createMAVLink()" style="align-self: flex-start;">Create</button>
+                </div>
+            </details>
+        </div>
+
         <div class="actions">
             <button class="btn btn-danger" id="disconnect-btn" style="display: none;">Disconnect</button>
         </div>
@@ -250,6 +268,7 @@
                         if (msg.type === 'status') updateStatus(msg.data);
                         if (msg.type === 'peers') updatePeers(msg.data);
                         if (msg.type === 'chat') updateChat(msg.data);
+                        if (msg.type === 'mavlink_links') updateMAVLinkLinks(msg.data);
                     }
                 } catch (e) {
                     console.error('Failed to parse message:', e);
@@ -322,10 +341,76 @@
             }
         }
 
+        function updateMAVLinkLinks(links) {
+            const container = document.getElementById('mavlink-links');
+            if (!links || links.length === 0) {
+                container.innerHTML = '<div style="color: #666; font-size: 13px; padding: 8px;">No MAVLink links configured</div>';
+                return;
+            }
+            container.innerHTML = links.map(link => {
+                const connected = link.connected || false;
+                const statusColor = connected ? '#4ade80' : '#666';
+                const up = link.bytes_sent || 0;
+                const down = link.bytes_recv || 0;
+                return `<div style="display: flex; justify-content: space-between; align-items: center; padding: 12px; margin-bottom: 8px; background: #0a0a0a; border-radius: 6px;">
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500; color: #fff;">${(link.name || '').replace(/</g, '&lt;')}</div>
+                        <div style="font-size: 13px; color: #666; font-family: monospace;">${(link.protocol || '').toUpperCase()} ${link.listen_addr || ''} → ${link.target_addr || ''}</div>
+                        <div style="font-size: 12px; color: #555; margin-top: 2px;">↑ ${formatBytes(up)} ↓ ${formatBytes(down)}</div>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 12px;">
+                        <div style="width: 8px; height: 8px; border-radius: 50%; background: ${statusColor};"></div>
+                        <button onclick="deleteMAVLink('${(link.name || '').replace(/'/g, "\\'")}')" style="background: none; border: none; color: #dc2626; cursor: pointer; font-size: 16px; padding: 4px;">✕</button>
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        async function createMAVLink() {
+            const name = document.getElementById('mavlink-name').value.trim();
+            const protocol = document.getElementById('mavlink-protocol').value;
+            const listen = document.getElementById('mavlink-listen').value.trim();
+            const target = document.getElementById('mavlink-target').value.trim();
+            if (!name || !listen || !target) return;
+            try {
+                await fetch('/api/mavlink/links?token=' + token, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, protocol, listen_addr: listen, target_addr: target })
+                });
+                document.getElementById('mavlink-name').value = '';
+                document.getElementById('mavlink-target').value = '';
+                fetchMAVLinkLinks();
+            } catch (e) {
+                console.error('Failed to create MAVLink link:', e);
+            }
+        }
+
+        async function deleteMAVLink(name) {
+            try {
+                await fetch('/api/mavlink/links?token=' + token + '&name=' + encodeURIComponent(name), { method: 'DELETE' });
+                fetchMAVLinkLinks();
+            } catch (e) {
+                console.error('Failed to delete MAVLink link:', e);
+            }
+        }
+
+        async function fetchMAVLinkLinks() {
+            try {
+                const res = await fetch('/api/mavlink/links?token=' + token);
+                if (res.ok) {
+                    updateMAVLinkLinks(await res.json());
+                }
+            } catch (e) {
+                console.error('Failed to fetch MAVLink links:', e);
+            }
+        }
+
         // Initial fetch
         fetchStatus();
         fetchPeers();
         fetchChat();
+        fetchMAVLinkLinks();
 
         // Connect WebSocket for real-time updates
         connectWebSocket();
@@ -333,6 +418,7 @@
         // Periodic refresh as fallback
         setInterval(fetchStatus, 5000);
         setInterval(fetchPeers, 5000);
+        setInterval(fetchMAVLinkLinks, 3000);
     </script>
 </body>
 </html>

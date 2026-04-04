@@ -27,8 +27,10 @@ type Server struct {
 	api          *API
 	wsHub        *Hub
 	authToken    string
-	running      bool
-	onChatSend   func(text string)
+	running         bool
+	onChatSend      func(text string)
+	onMAVLinkCreate func(name, protocol, listen, target string) error
+	onMAVLinkDelete func(name string) error
 }
 
 // Config configures the GUI server
@@ -231,6 +233,22 @@ func (s *Server) openBrowser() {
 	}
 
 	cmd.Start()
+}
+
+// SetMAVLinkHandlers sets the callbacks for MAVLink link create and delete
+func (s *Server) SetMAVLinkHandlers(onCreate func(name, protocol, listen, target string) error, onDelete func(name string) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onMAVLinkCreate = onCreate
+	s.onMAVLinkDelete = onDelete
+}
+
+// BroadcastMAVLinkLinks updates stored links and broadcasts to all clients
+func (s *Server) BroadcastMAVLinkLinks(links interface{}) {
+	if typedLinks, ok := links.([]map[string]interface{}); ok {
+		s.api.SetMAVLinkLinks(typedLinks)
+	}
+	s.Broadcast("mavlink_links", links)
 }
 
 // SetChatHandler sets the callback invoked when a client sends a chat message
