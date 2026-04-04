@@ -405,6 +405,13 @@ func startDaemon(configDir string, foreground bool) error {
 			fmt.Printf("  Peer joined: %s (%s)\n", m.NodeID, m.MeshIP)
 			routeTable.UpdateFromGossip(gossipService.Members())
 			updateGUIPeers()
+			// Add as MAVLink forwarding target (mesh_ip:14550)
+			if m.MeshIP.IsValid() && m.NodeID != meshConfig.NodeID {
+				target := net.JoinHostPort(m.MeshIP.String(), "14550")
+				if err := mavProxy.AddTarget(target); err == nil {
+					fmt.Printf("  MAVLink target: %s\n", target)
+				}
+			}
 			// Register the new peer's WG public key for knock auth + WireGuard
 			if m.PublicKey != "" && m.NodeID != meshConfig.NodeID {
 				if keyBytes, err := base64.StdEncoding.DecodeString(m.PublicKey); err == nil {

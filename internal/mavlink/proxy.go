@@ -17,6 +17,11 @@ type ProxyConfig struct {
 	// If empty, Deliver is a no-op for the forward path.
 	ForwardAddr string
 
+	// RemoteTargets are mesh IPs (or host:port) to forward MAVLink packets to.
+	// Each target gets a UDP connection through the mesh tunnel.
+	// Example: ["10.99.0.2:14550", "10.99.0.3:14550"]
+	RemoteTargets []string
+
 	// OnPacket is called for each UDP datagram that passes IsMAVLink.
 	// It is called synchronously from the read loop; implementations must not block.
 	OnPacket func(data []byte, info *PacketInfo)
@@ -43,6 +48,9 @@ type Proxy struct {
 	// clientAddr is the most-recently-seen remote sender address.
 	mu         sync.Mutex
 	clientAddr *net.UDPAddr
+
+	// remoteConns are outbound UDP connections to other mesh nodes
+	remoteConns []*net.UDPConn
 
 	// stats — individual uint64 fields kept in a struct for atomic access.
 	pktsReceived  atomic.Uint64
@@ -80,6 +88,23 @@ func (p *Proxy) Start() error {
 	p.conn = conn
 	p.listenAddr = conn.LocalAddr()
 
+	// Connect to remote targets (other mesh nodes' MAVLink ports)
+	for _, target := range p.cfg.RemoteTargets {
+		raddr, err := net.ResolveUDPAddr("udp4", target)
+		if err != nil {
+			continue
+		}
+		rc, err := net.DialUDP("udp4", nil, raddr)
+		if err != nil {
+			continue
+		}
+		p.remoteConns = append(p.remoteConns, rc)
+
+		// Start receive loop for remote responses (telemetry from drones)
+		p.wg.Add(1)
+		go p.remoteReadLoop(rc)
+	}
+
 	p.wg.Add(1)
 	go p.readLoop()
 
@@ -92,7 +117,30 @@ func (p *Proxy) Stop() {
 	if p.conn != nil {
 		p.conn.Close()
 	}
+	for _, rc := range p.remoteConns {
+		rc.Close()
+	}
 	p.wg.Wait()
+}
+
+// AddTarget opens a UDP connection to a remote mesh node's MAVLink port.
+// Can be called after Start to dynamically add targets (e.g., from gossip).
+func (p *Proxy) AddTarget(addr string) error {
+	raddr, err := net.ResolveUDPAddr("udp4", addr)
+	if err != nil {
+		return err
+	}
+	rc, err := net.DialUDP("udp4", nil, raddr)
+	if err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.remoteConns = append(p.remoteConns, rc)
+	p.mu.Unlock()
+
+	p.wg.Add(1)
+	go p.remoteReadLoop(rc)
+	return nil
 }
 
 // ListenAddr returns the actual bound address (useful when port 0 was specified).
@@ -177,5 +225,51 @@ func (p *Proxy) readLoop() {
 		if p.cfg.OnPacket != nil {
 			p.cfg.OnPacket(data, info)
 		}
+
+		// Forward to all remote targets through the mesh tunnel
+		p.mu.Lock()
+		targets := p.remoteConns
+		p.mu.Unlock()
+		for _, rc := range targets {
+			rc.Write(data)
+		}
+		if len(targets) > 0 {
+			p.pktsForwarded.Add(1)
+			p.bytesForwarded.Add(uint64(n))
+		}
+	}
+}
+
+// remoteReadLoop reads MAVLink packets from a remote mesh node and delivers
+// them to the local GCS/autopilot.
+func (p *Proxy) remoteReadLoop(rc *net.UDPConn) {
+	defer p.wg.Done()
+
+	buf := make([]byte, 65535)
+	for {
+		select {
+		case <-p.done:
+			return
+		default:
+		}
+
+		n, err := rc.Read(buf)
+		if err != nil {
+			select {
+			case <-p.done:
+				return
+			default:
+				continue
+			}
+		}
+
+		data := make([]byte, n)
+		copy(data, buf[:n])
+
+		p.pktsReceived.Add(1)
+		p.bytesReceived.Add(uint64(n))
+
+		// Deliver to local GCS
+		p.Deliver(data)
 	}
 }
