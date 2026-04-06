@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"strconv"
 	"strings"
 	"net/netip"
 	"os"
@@ -270,7 +271,7 @@ func startDaemon(configDir string, foreground bool) error {
 	// Determine the host's reachable IP for gossip.
 	// Gossip probes must use an IP that's routable on the underlay network
 	// (not the mesh overlay IP, which requires a working tunnel).
-	gossipPort := "7946"
+	gossipPort := "7947"
 	gossipAdvertiseIP := detectOutboundIP()
 	selfGossipAddr := gossipAdvertiseIP + ":" + gossipPort
 
@@ -612,10 +613,16 @@ func startDaemon(configDir string, foreground bool) error {
 			return fmt.Errorf("generate TLS cert: %w", err)
 		}
 
-		// Determine listen address
+		// Determine listen address for enrollment server.
+		// Use a separate port from the transport listener to avoid conflicts.
 		listenAddr := meshConfig.Transport.HTTPS.ListenAddr
 		if listenAddr == "" {
 			listenAddr = ":443"
+		}
+		// Bump port by 1 so enrollment doesn't collide with the transport.
+		enrollAddr, err := offsetPort(listenAddr, 1)
+		if err != nil {
+			enrollAddr = ":8445" // fallback
 		}
 
 		// Create save function
@@ -624,7 +631,7 @@ func startDaemon(configDir string, foreground bool) error {
 		}
 
 		serverCfg := &api.ServerConfig{
-			ListenAddr:  listenAddr,
+			ListenAddr:  enrollAddr,
 			TLSCert:     tlsCert,
 			AdminConfig: adminConfig,
 			CA:          ca,
@@ -644,7 +651,7 @@ func startDaemon(configDir string, foreground bool) error {
 			}
 		}()
 
-		fmt.Printf("  Enrollment server listening on %s\n", listenAddr)
+		fmt.Printf("  Enrollment server listening on %s\n", enrollAddr)
 		fmt.Println()
 	}
 
@@ -930,4 +937,17 @@ func newDownCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&force, "force", false, "force immediate shutdown (SIGKILL)")
 
 	return cmd
+}
+
+// offsetPort takes a host:port address and adds delta to the port number.
+func offsetPort(addr string, delta int) (string, error) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", err
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", err
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port+delta)), nil
 }

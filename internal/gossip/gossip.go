@@ -43,7 +43,7 @@ type Config struct {
 // DefaultConfig returns default gossip configuration
 func DefaultConfig() *Config {
 	return &Config{
-		BindAddr:         ":7946",
+		BindAddr:         ":7947",
 		GossipInterval:   1 * time.Second,
 		ProbeInterval:    500 * time.Millisecond,
 		ProbeTimeout:     500 * time.Millisecond,

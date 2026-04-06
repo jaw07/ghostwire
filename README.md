@@ -39,7 +39,7 @@ GUI runs on `:9999` with token auth. Printed at startup.
 CLI
   init | join | up | down | status | panic | enroll
 Mesh
-  SWIM gossip (UDP 7946, HMAC-SHA256, replay dedup)
+  SWIM gossip (UDP 7947, HMAC-SHA256, replay dedup)
   Routing table (direct / relay / multi-hop)
   NAT traversal (STUN + hole punch)
   Policy engine (CEL, default-deny)
