@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"math/big"
 	"net"
-	"strconv"
 	"strings"
 	"net/netip"
 	"os"
@@ -613,16 +612,11 @@ func startDaemon(configDir string, foreground bool) error {
 			return fmt.Errorf("generate TLS cert: %w", err)
 		}
 
-		// Determine listen address for enrollment server.
-		// Use a separate port from the transport listener to avoid conflicts.
-		listenAddr := meshConfig.Transport.HTTPS.ListenAddr
-		if listenAddr == "" {
-			listenAddr = ":443"
-		}
-		// Bump port by 1 so enrollment doesn't collide with the transport.
-		enrollAddr, err := offsetPort(listenAddr, 1)
-		if err != nil {
-			enrollAddr = ":8445" // fallback
+		// Enrollment server binds to ListenAddr; the WireGuard tunnel listener
+		// uses TransportListenAddr (handled above), so the two never collide.
+		enrollAddr := meshConfig.Transport.HTTPS.ListenAddr
+		if enrollAddr == "" {
+			enrollAddr = ":443"
 		}
 
 		// Create save function
@@ -937,17 +931,4 @@ func newDownCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&force, "force", false, "force immediate shutdown (SIGKILL)")
 
 	return cmd
-}
-
-// offsetPort takes a host:port address and adds delta to the port number.
-func offsetPort(addr string, delta int) (string, error) {
-	host, portStr, err := net.SplitHostPort(addr)
-	if err != nil {
-		return "", err
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return "", err
-	}
-	return net.JoinHostPort(host, strconv.Itoa(port+delta)), nil
 }

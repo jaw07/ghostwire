@@ -64,7 +64,8 @@ func newTestSetup(t *testing.T, maxUses int) *testSetup {
 			Transport: config.TransportConfig{
 				Active: "https-mimic",
 				HTTPS: config.HTTPSTransportConfig{
-					ListenAddr: "0.0.0.0:8443",
+					ListenAddr:          "0.0.0.0:8443",
+					TransportListenAddr: "0.0.0.0:8444",
 				},
 			},
 		},
@@ -551,8 +552,22 @@ func TestBuildPeerList_AdminEndpoints(t *testing.T) {
 	if len(peers[0].Endpoints) == 0 {
 		t.Error("expected admin peer to have endpoints from transport config")
 	}
+	if peers[0].Endpoints[0] != "0.0.0.0:8444" {
+		t.Errorf("expected endpoint 0.0.0.0:8444 (TransportListenAddr), got %q", peers[0].Endpoints[0])
+	}
+}
+
+func TestBuildPeerList_AdminEndpoints_FallbackToListenAddr(t *testing.T) {
+	ts := newTestSetup(t, 1)
+	ts.adminConfig.Peers = nil
+	ts.adminConfig.Transport.HTTPS.TransportListenAddr = ""
+
+	peers := ts.server.buildPeerList("x")
+	if len(peers[0].Endpoints) == 0 {
+		t.Error("expected admin peer to have endpoints from transport config")
+	}
 	if peers[0].Endpoints[0] != "0.0.0.0:8443" {
-		t.Errorf("expected endpoint 0.0.0.0:8443, got %q", peers[0].Endpoints[0])
+		t.Errorf("expected endpoint 0.0.0.0:8443 (ListenAddr fallback), got %q", peers[0].Endpoints[0])
 	}
 }
 
