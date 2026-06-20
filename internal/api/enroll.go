@@ -20,6 +20,10 @@ import (
 	"github.com/ghostwire/ghostwire/internal/token"
 )
 
+// maxEnrollBodyBytes caps the enrollment request body to bound memory use from
+// a malicious or buggy client.
+const maxEnrollBodyBytes = 64 * 1024
+
 // EnrollmentServer handles node enrollment requests
 type EnrollmentServer struct {
 	ca          *pki.CertificateAuthority
@@ -28,8 +32,52 @@ type EnrollmentServer struct {
 	meshSecret  []byte
 	saveConfig  func(*config.AdminConfig) error
 
+	limiter *enrollLimiter
+
 	server   *http.Server
 	listener net.Listener
+}
+
+// enrollLimiter is a small fixed-window per-source-IP rate limiter that throttles
+// enrollment attempts (token brute-force / Ed25519-verify CPU DoS / peer-table
+// growth) without an external dependency.
+type enrollLimiter struct {
+	mu     sync.Mutex
+	counts map[string]*ipWindow
+	max    int
+	window time.Duration
+}
+
+type ipWindow struct {
+	count int
+	start time.Time
+}
+
+func newEnrollLimiter(max int, window time.Duration) *enrollLimiter {
+	return &enrollLimiter{counts: make(map[string]*ipWindow), max: max, window: window}
+}
+
+// allow reports whether a request from ip is permitted at time now.
+func (l *enrollLimiter) allow(ip string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Bound memory: if the table grows pathologically (many distinct source
+	// IPs), drop it and start fresh rather than leak.
+	if len(l.counts) > 10000 {
+		l.counts = make(map[string]*ipWindow)
+	}
+
+	w := l.counts[ip]
+	if w == nil || now.Sub(w.start) > l.window {
+		l.counts[ip] = &ipWindow{count: 1, start: now}
+		return true
+	}
+	if w.count >= l.max {
+		return false
+	}
+	w.count++
+	return true
 }
 
 // EnrollmentRequest is sent by joining nodes
@@ -42,23 +90,23 @@ type EnrollmentRequest struct {
 
 // EnrollmentResponse is returned to joining nodes
 type EnrollmentResponse struct {
-	NodeID          string              `json:"node_id"`
-	Certificate     string              `json:"certificate"`      // PEM-encoded node certificate
-	CACertificate   string              `json:"ca_certificate"`   // PEM-encoded CA certificate
-	MeshName        string              `json:"mesh_name"`
-	MeshID          string              `json:"mesh_id"`
-	MeshSubnet      string              `json:"mesh_subnet"`
-	AssignedIP      string              `json:"assigned_ip"`
-	MeshSecret      string              `json:"mesh_secret"`      // Base64 mesh secret for knock auth
-	Roles           []string            `json:"roles"`
-	Peers           []config.PeerConfig `json:"peers"`
+	NodeID          string                 `json:"node_id"`
+	Certificate     string                 `json:"certificate"`    // PEM-encoded node certificate
+	CACertificate   string                 `json:"ca_certificate"` // PEM-encoded CA certificate
+	MeshName        string                 `json:"mesh_name"`
+	MeshID          string                 `json:"mesh_id"`
+	MeshSubnet      string                 `json:"mesh_subnet"`
+	AssignedIP      string                 `json:"assigned_ip"`
+	MeshSecret      string                 `json:"mesh_secret"` // Base64 mesh secret for knock auth
+	Roles           []string               `json:"roles"`
+	Peers           []config.PeerConfig    `json:"peers"`
 	TransportConfig config.TransportConfig `json:"transport"`
 }
 
 // ErrorResponse is returned on errors
 type ErrorResponse struct {
-	Error   string `json:"error"`
-	Code    string `json:"code"`
+	Error string `json:"error"`
+	Code  string `json:"code"`
 }
 
 // ServerConfig holds configuration for the enrollment server
@@ -78,6 +126,8 @@ func NewEnrollmentServer(cfg *ServerConfig) (*EnrollmentServer, error) {
 		adminConfig: cfg.AdminConfig,
 		meshSecret:  cfg.MeshSecret,
 		saveConfig:  cfg.SaveConfig,
+		// Allow up to 10 enrollment attempts per minute from a single source IP.
+		limiter: newEnrollLimiter(10, time.Minute),
 	}
 
 	mux := http.NewServeMux()
@@ -143,6 +193,19 @@ func (s *EnrollmentServer) handleEnroll(w http.ResponseWriter, r *http.Request) 
 		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST required")
 		return
 	}
+
+	// Per-source-IP rate limit to blunt token brute-force and CPU/peer-table DoS.
+	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		clientIP = r.RemoteAddr
+	}
+	if s.limiter != nil && !s.limiter.allow(clientIP, time.Now()) {
+		s.writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many enrollment attempts")
+		return
+	}
+
+	// Bound the request body before decoding.
+	r.Body = http.MaxBytesReader(w, r.Body, maxEnrollBodyBytes)
 
 	var req EnrollmentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -250,34 +313,86 @@ func (s *EnrollmentServer) handleEnroll(w http.ResponseWriter, r *http.Request) 
 	// Build peer list for the new node (include admin and other peers)
 	peers := s.buildPeerList(nodeName)
 
-	// Copy config ref for saving outside the lock
-	adminConfigCopy := s.adminConfig
-	s.configMu.Unlock()
-
-	// Save updated admin config outside of the lock to avoid holding it during slow I/O
-	if s.saveConfig != nil {
-		if err := s.saveConfig(adminConfigCopy); err != nil {
-			fmt.Printf("Warning: failed to save admin config: %v\n", err)
-		}
+	// Build the response while still holding the lock so the admin-config reads
+	// are consistent with the peer/IP we just allocated. Reading these fields
+	// after unlocking (the old behavior) raced with concurrent enrollments
+	// mutating the same struct.
+	resp := &EnrollmentResponse{
+		NodeID:          nodeName,
+		Certificate:     string(pki.CertificateToPEM(cert)),
+		CACertificate:   s.adminConfig.CACertChain,
+		MeshName:        s.adminConfig.MeshName,
+		MeshID:          s.adminConfig.MeshID,
+		MeshSubnet:      s.adminConfig.MeshSubnet,
+		AssignedIP:      assignedIP,
+		MeshSecret:      s.adminConfig.MeshSecret,
+		Roles:           tok.AllowedRoles,
+		Peers:           peers,
+		TransportConfig: s.adminConfig.Transport,
 	}
 
-	// Build response
-	resp := &EnrollmentResponse{
-		NodeID:        nodeName,
-		Certificate:   string(pki.CertificateToPEM(cert)),
-		CACertificate: s.adminConfig.CACertChain,
-		MeshName:      s.adminConfig.MeshName,
-		MeshID:        s.adminConfig.MeshID,
-		MeshSubnet:    s.adminConfig.MeshSubnet,
-		AssignedIP:    assignedIP,
-		MeshSecret:    s.adminConfig.MeshSecret,
-		Roles:         tok.AllowedRoles,
-		Peers:         peers,
-		TransportConfig: s.adminConfig.Transport,
+	// Persist the updated admin config (including the incremented token
+	// UsedCount) while still holding the lock. Enrollment is infrequent, so
+	// serializing the save under the lock is an acceptable trade for
+	// eliminating the pointer-copy race. We fail closed: if the token-use
+	// increment cannot be persisted, the token would be reusable after a
+	// restart, so we refuse the enrollment rather than issue silently.
+	var saveErr error
+	if s.saveConfig != nil {
+		saveErr = s.saveConfig(s.adminConfig)
+	}
+	s.configMu.Unlock()
+
+	if saveErr != nil {
+		s.writeError(w, http.StatusInternalServerError, "persist_failed",
+			fmt.Sprintf("could not persist enrollment state: %v", saveErr))
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// CreateToken generates a new enrollment token against the live, in-memory
+// admin config. Because the running enrollment server shares this same config,
+// the token is honored immediately — no daemon restart and no second scrypt
+// decrypt of the on-disk config (the prior out-of-band `enroll create` flow
+// required both). The updated config is persisted via saveConfig.
+func (s *EnrollmentServer) CreateToken(roles []string, expires time.Duration, maxUses int, nodeName string) (string, error) {
+	if len(roles) == 0 {
+		roles = []string{"operator"}
+	}
+
+	generator := token.NewGenerator(s.ca.RootKey(), s.ca.MeshID)
+	tokenStr, tok, err := generator.Generate(&token.GeneratorOptions{
+		Roles:         roles,
+		Expiry:        expires,
+		MaxUses:       maxUses,
+		SuggestedName: nodeName,
+	})
+	if err != nil {
+		return "", fmt.Errorf("generate token: %w", err)
+	}
+
+	s.configMu.Lock()
+	s.adminConfig.EnrollmentTokens = append(s.adminConfig.EnrollmentTokens, config.StoredToken{
+		TokenID:   hex.EncodeToString(tok.ID[:]),
+		CreatedAt: time.Now(),
+		ExpiresAt: tok.NotAfter,
+		Roles:     roles,
+		MaxUses:   maxUses,
+		UsedCount: 0,
+	})
+	var saveErr error
+	if s.saveConfig != nil {
+		saveErr = s.saveConfig(s.adminConfig)
+	}
+	s.configMu.Unlock()
+
+	if saveErr != nil {
+		return "", fmt.Errorf("persist token: %w", saveErr)
+	}
+	return tokenStr, nil
 }
 
 func (s *EnrollmentServer) getCAPublicKey() ed25519.PublicKey {
@@ -292,32 +407,75 @@ func (s *EnrollmentServer) allocateIP(nodeID string) (string, error) {
 	if ip, exists := alloc.Allocated[nodeID]; exists {
 		return ip, nil
 	}
-
-	// Parse next IP
-	nextIP := net.ParseIP(alloc.NextIP)
-	if nextIP == nil {
-		return "", fmt.Errorf("invalid next IP: %s", alloc.NextIP)
-	}
-
-	// Allocate
-	assignedIP := nextIP.String()
 	if alloc.Allocated == nil {
 		alloc.Allocated = make(map[string]string)
 	}
-	alloc.Allocated[nodeID] = assignedIP
 
-	// Increment next IP
-	ip4 := nextIP.To4()
-	if ip4 != nil {
-		// Simple increment for IPv4
-		ip4[3]++
-		if ip4[3] == 0 {
-			ip4[2]++
-		}
-		alloc.NextIP = ip4.String()
+	// Bound allocation to the mesh subnet so we never hand out an address
+	// outside the overlay (the old code only ever incremented the low octets
+	// with no boundary check, eventually bleeding past the subnet).
+	_, subnet, err := net.ParseCIDR(s.adminConfig.MeshSubnet)
+	if err != nil {
+		return "", fmt.Errorf("invalid mesh subnet %q: %w", s.adminConfig.MeshSubnet, err)
 	}
 
-	return assignedIP, nil
+	// Set of addresses already in use, to avoid collisions.
+	used := make(map[string]bool, len(alloc.Allocated)+1)
+	for _, ip := range alloc.Allocated {
+		used[ip] = true
+	}
+	if s.adminConfig.AssignedIP != "" {
+		used[s.adminConfig.AssignedIP] = true
+	}
+
+	candidate := net.ParseIP(alloc.NextIP).To4()
+	if candidate == nil {
+		return "", fmt.Errorf("invalid next IP: %s", alloc.NextIP)
+	}
+	candidate = append(net.IP(nil), candidate...) // work on a copy
+
+	// Scan forward for the next free, in-subnet, non-reserved address.
+	for {
+		if !subnet.Contains(candidate) {
+			return "", fmt.Errorf("IP pool exhausted for subnet %s", subnet.String())
+		}
+		ipStr := candidate.String()
+		if !isReservedIP(candidate, subnet) && !used[ipStr] {
+			alloc.Allocated[nodeID] = ipStr
+			next := append(net.IP(nil), candidate...)
+			incIP(next)
+			alloc.NextIP = next.String()
+			return ipStr, nil
+		}
+		incIP(candidate)
+	}
+}
+
+// isReservedIP reports whether ip is the subnet's network or broadcast address.
+func isReservedIP(ip net.IP, subnet *net.IPNet) bool {
+	ip4 := ip.To4()
+	network := subnet.IP.Mask(subnet.Mask).To4()
+	if ip4 == nil || network == nil {
+		return false
+	}
+	if ip4.Equal(network) {
+		return true // network address
+	}
+	broadcast := make(net.IP, len(network))
+	for i := range network {
+		broadcast[i] = network[i] | ^subnet.Mask[i]
+	}
+	return ip4.Equal(broadcast)
+}
+
+// incIP increments an IP address in place with carry across all octets.
+func incIP(ip net.IP) {
+	for i := len(ip) - 1; i >= 0; i-- {
+		ip[i]++
+		if ip[i] != 0 {
+			break
+		}
+	}
 }
 
 func (s *EnrollmentServer) buildPeerList(excludeNodeID string) []config.PeerConfig {
@@ -361,6 +519,12 @@ func (s *EnrollmentServer) getAdminWGPubKey() string {
 }
 
 func (s *EnrollmentServer) getAdminEndpoints() []string {
+	// A configured advertise endpoint (e.g. a Cloudflare tunnel hostname) wins:
+	// it is the address enrolling nodes can actually reach, which may differ
+	// from the local listen address.
+	if s.adminConfig.Transport.HTTPS.AdvertiseEndpoint != "" {
+		return []string{s.adminConfig.Transport.HTTPS.AdvertiseEndpoint}
+	}
 	// Return the transport listener address (for WireGuard tunnel connections),
 	// not the enrollment server address
 	if s.adminConfig.Transport.HTTPS.TransportListenAddr != "" {

@@ -5,7 +5,12 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+// transientReadBackoff is the pause applied after a transient read/accept error
+// so a persistent error condition cannot spin a CPU core at 100%.
+const transientReadBackoff = 10 * time.Millisecond
 
 // ProxyConfig configures a MAVLink UDP proxy.
 type ProxyConfig struct {
@@ -53,10 +58,10 @@ type Proxy struct {
 	remoteConns []*net.UDPConn
 
 	// stats — individual uint64 fields kept in a struct for atomic access.
-	pktsReceived  atomic.Uint64
-	pktsForwarded atomic.Uint64
-	pktsDropped   atomic.Uint64
-	bytesReceived atomic.Uint64
+	pktsReceived   atomic.Uint64
+	pktsForwarded  atomic.Uint64
+	pktsDropped    atomic.Uint64
+	bytesReceived  atomic.Uint64
 	bytesForwarded atomic.Uint64
 
 	wg   sync.WaitGroup
@@ -200,8 +205,10 @@ func (p *Proxy) readLoop() {
 				return
 			default:
 			}
-			// Transient error — keep looping.
+			// Transient error — back off briefly so a persistent error
+			// (e.g. a half-closed socket) cannot spin the CPU.
 			p.pktsDropped.Add(1)
+			time.Sleep(transientReadBackoff)
 			continue
 		}
 
@@ -259,6 +266,7 @@ func (p *Proxy) remoteReadLoop(rc *net.UDPConn) {
 			case <-p.done:
 				return
 			default:
+				time.Sleep(transientReadBackoff)
 				continue
 			}
 		}

@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l $(git ls-files '*.go'))
+          if [ -n "$out" ]; then echo "unformatted files:"; echo "$out"; exit 1; fi
+
+      # Tests that don't require a TUN device / CAP_NET_ADMIN run everywhere.
+      # The tunnel package's mesh-integration tests create real TUN devices and
+      # are exercised separately in the privileged job below.
+      - name: Test (unit)
+        run: |
+          go test $(go list ./... | grep -v '/internal/tunnel$')
+          go test ./internal/tunnel/ -run 'TestFilteredTUN|TestHTTPSBind'
+
+  tunnel-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # The mesh integration tests need /dev/net/tun + CAP_NET_ADMIN.
+      - name: Enable TUN
+        run: sudo modprobe tun || true
+      - name: Test (tunnel integration, privileged)
+        run: sudo -E env "PATH=$PATH" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)" go test ./internal/tunnel/

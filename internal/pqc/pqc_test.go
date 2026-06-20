@@ -267,6 +267,65 @@ func TestSchemeString(t *testing.T) {
 	}
 }
 
+func TestEncapsulateRejectsMalformedKey(t *testing.T) {
+	// A short/long Kyber public key must return an error, not panic.
+	for _, size := range []int{0, 1, KyberPublicKeySize - 1, KyberPublicKeySize + 1} {
+		bad := &PublicKey{Scheme: SchemeX25519Kyber768, KyberPublic: make([]byte, size)}
+		_, _, err := Encapsulate(bad)
+		if err == nil {
+			t.Errorf("Encapsulate(KyberPublic len=%d) = nil error, want error", size)
+		}
+	}
+}
+
+func TestDecapsulateRejectsMalformedCiphertext(t *testing.T) {
+	recipient, _ := Generate()
+	// A wrong-length ciphertext must return an error, not panic.
+	for _, size := range []int{0, 1, KyberCiphertextSize - 1, KyberCiphertextSize + 1} {
+		enc := &Encapsulation{KyberCiphertext: make([]byte, size)}
+		_, err := recipient.Decapsulate(enc)
+		if err == nil {
+			t.Errorf("Decapsulate(ciphertext len=%d) = nil error, want error", size)
+		}
+	}
+}
+
+func TestTranscriptBinding(t *testing.T) {
+	recipient, _ := Generate()
+	senderSS, enc, err := Encapsulate(recipient.Public())
+	if err != nil {
+		t.Fatalf("Encapsulate error: %v", err)
+	}
+
+	// Tampering with the ephemeral must change the recipient's derived secret,
+	// proving the combined key is bound to the transcript (not just the raw
+	// KEM outputs). Flip a byte the X25519 secret does not depend on directly
+	// is hard, so instead confirm an honest round-trip matches and a swapped
+	// ciphertext (which alters the transcript) yields a different combined key.
+	good, err := recipient.Decapsulate(enc)
+	if err != nil {
+		t.Fatalf("Decapsulate error: %v", err)
+	}
+	if senderSS.Combined != good.Combined {
+		t.Fatal("honest round-trip combined secrets must match")
+	}
+
+	// Re-derive with a tampered ephemeral; the combined secret must differ
+	// even though we reuse the same Kyber ciphertext.
+	tampered := &Encapsulation{
+		X25519Ephemeral: enc.X25519Ephemeral,
+		KyberCiphertext: append([]byte(nil), enc.KyberCiphertext...),
+	}
+	tampered.X25519Ephemeral[0] ^= 0xFF
+	other, err := recipient.Decapsulate(tampered)
+	if err != nil {
+		t.Fatalf("Decapsulate(tampered) error: %v", err)
+	}
+	if other.Combined == good.Combined {
+		t.Error("tampered ephemeral must produce a different combined secret")
+	}
+}
+
 func BenchmarkGenerate(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		kp, _ := Generate()

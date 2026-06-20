@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"runtime"
+	"strings"
 	"sync"
 
 	"golang.org/x/crypto/curve25519"
@@ -20,7 +22,8 @@ import (
 type Device struct {
 	wgDevice   *device.Device
 	tunDevice  tun.Device
-	wgBind     conn.Bind // retained for listener management
+	filterTUN  *filteredTUN // wraps tunDevice; applies the policy packet filter
+	wgBind     conn.Bind    // retained for listener management
 	privateKey [32]byte
 	publicKey  [32]byte
 	meshIP     netip.Addr
@@ -64,6 +67,14 @@ type Config struct {
 	HTTPSConfig *BindConfig
 }
 
+// SetPacketFilter attaches a PacketFilter (e.g. the policy enforcer) to the
+// data path. It may be called after the device is up; pass nil to disable
+// filtering. Packets read from the TUN are checked with direction "egress" and
+// packets written to the TUN with direction "ingress".
+func (d *Device) SetPacketFilter(filter PacketFilter) {
+	d.filterTUN.SetFilter(filter)
+}
+
 // DefaultConfig returns a Config with sensible defaults
 func DefaultConfig() *Config {
 	return &Config{
@@ -91,8 +102,16 @@ func New(cfg *Config) (*Device, error) {
 	// Create logger
 	logger := device.NewLogger(cfg.LogLevel, fmt.Sprintf("(%s) ", cfg.InterfaceName))
 
+	// macOS requires the TUN device be named "utun" or "utunN"; a Linux-style
+	// name like "gw0" is rejected. Pass "utun" so the kernel assigns the next
+	// free utun unit (the real name is read back from tunDev.Name() below).
+	ifName := cfg.InterfaceName
+	if runtime.GOOS == "darwin" && !strings.HasPrefix(ifName, "utun") {
+		ifName = "utun"
+	}
+
 	// Create TUN device
-	tunDev, err := tun.CreateTUN(cfg.InterfaceName, cfg.MTU)
+	tunDev, err := tun.CreateTUN(ifName, cfg.MTU)
 	if err != nil {
 		return nil, fmt.Errorf("create TUN device: %w", err)
 	}
@@ -130,8 +149,12 @@ func New(cfg *Config) (*Device, error) {
 		wgBind = conn.NewDefaultBind()
 	}
 
+	// Wrap the TUN so the policy enforcer can filter packets in both
+	// directions. With no filter attached this is a transparent pass-through.
+	filterTUN := newFilteredTUN(tunDev)
+
 	// Create WireGuard device
-	wgDev := device.NewDevice(tunDev, wgBind, logger)
+	wgDev := device.NewDevice(filterTUN, wgBind, logger)
 
 	// Configure private key
 	if err := wgDev.IpcSet(fmt.Sprintf("private_key=%s\n", keyToHex(cfg.PrivateKey[:]))); err != nil {
@@ -156,6 +179,7 @@ func New(cfg *Config) (*Device, error) {
 	d := &Device{
 		wgDevice:   wgDev,
 		tunDevice:  tunDev,
+		filterTUN:  filterTUN,
 		wgBind:     wgBind,
 		privateKey: cfg.PrivateKey,
 		publicKey:  publicKey,

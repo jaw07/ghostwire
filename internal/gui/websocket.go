@@ -2,7 +2,9 @@ package gui
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -26,10 +28,32 @@ const (
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		// Allow local connections only
+	CheckOrigin:     checkLocalOrigin,
+}
+
+// checkLocalOrigin only permits WebSocket upgrades from loopback origins (or
+// requests with no Origin header, i.e. non-browser clients like the CLI). The
+// management API is loopback-bound; rejecting non-loopback origins defends
+// against DNS-rebinding / CSWSH from any web page the operator happens to
+// visit. Returning true unconditionally (the old behavior) allowed any site.
+func checkLocalOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// Non-browser client (CLI/curl) — browsers always send Origin on WS.
 		return true
-	},
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
 }
 
 // Message represents a WebSocket message

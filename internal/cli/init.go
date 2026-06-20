@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -20,12 +21,13 @@ import (
 
 func newInitCmd() *cobra.Command {
 	var (
-		meshName   string
-		outputDir  string
-		subnet     string
-		nodeID     string
-		serverName string
-		listenAddr string
+		meshName          string
+		outputDir         string
+		subnet            string
+		nodeID            string
+		serverName        string
+		listenAddr        string
+		advertiseEndpoint string
 	)
 
 	cmd := &cobra.Command{
@@ -43,22 +45,25 @@ The admin config will be saved to the output directory.`,
 				return fmt.Errorf("--mesh-name is required")
 			}
 
-			// Get passphrase
-			passphrase, err := promptPassphrase("Enter passphrase for config encryption: ")
+			// Get passphrase. A non-interactive source (GHOSTWIRE_PASSPHRASE[_FILE])
+			// is used directly for headless bootstrap; an interactive prompt is
+			// confirmed by re-entry.
+			passphrase, err := resolvePassphrase("Enter passphrase for config encryption: ")
 			if err != nil {
 				return fmt.Errorf("read passphrase: %w", err)
 			}
 
-			confirm, err := promptPassphrase("Confirm passphrase: ")
-			if err != nil {
-				return fmt.Errorf("read passphrase: %w", err)
+			if !passphraseFromEnv() {
+				confirm, err := promptPassphrase("Confirm passphrase: ")
+				if err != nil {
+					return fmt.Errorf("read passphrase: %w", err)
+				}
+				if passphrase != confirm {
+					return fmt.Errorf("passphrases do not match")
+				}
 			}
 
-			if passphrase != confirm {
-				return fmt.Errorf("passphrases do not match")
-			}
-
-			return initializeMesh(meshName, outputDir, subnet, nodeID, serverName, listenAddr, passphrase)
+			return initializeMesh(meshName, outputDir, subnet, nodeID, serverName, listenAddr, advertiseEndpoint, passphrase)
 		},
 	}
 
@@ -68,11 +73,12 @@ The admin config will be saved to the output directory.`,
 	cmd.Flags().StringVar(&nodeID, "node-id", "", "node ID for the admin node (default: hostname)")
 	cmd.Flags().StringVar(&serverName, "server-name", "", "TLS server name (SNI) for HTTPS transport")
 	cmd.Flags().StringVar(&listenAddr, "listen", ":443", "listen address for HTTPS transport")
+	cmd.Flags().StringVar(&advertiseEndpoint, "advertise", "", "host:port enrolling nodes should dial for the transport (e.g. behind a tunnel/NAT)")
 
 	return cmd
 }
 
-func initializeMesh(meshName, outputDir, subnet, nodeID, serverName, listenAddr, passphrase string) error {
+func initializeMesh(meshName, outputDir, subnet, nodeID, serverName, listenAddr, advertiseEndpoint, passphrase string) error {
 	// Set defaults
 	if outputDir == "" {
 		home, err := os.UserHomeDir()
@@ -179,6 +185,7 @@ func initializeMesh(meshName, outputDir, subnet, nodeID, serverName, listenAddr,
 				Active: "https-mimic",
 				HTTPS: config.HTTPSTransportConfig{
 					ServerName:          serverName,
+					AdvertiseEndpoint:   advertiseEndpoint,
 					Fingerprint:         "auto",
 					ListenAddr:          listenAddr,
 					TransportListenAddr: ":8444",
@@ -227,6 +234,35 @@ func initializeMesh(meshName, outputDir, subnet, nodeID, serverName, listenAddr,
 	fmt.Println("  3. Have other nodes join with 'ghostwire join --token <token>'")
 
 	return nil
+}
+
+// resolvePassphrase returns the config passphrase from a non-interactive
+// source if one is set, otherwise it falls back to an interactive prompt.
+// This lets the daemon run headless (e.g. in Kubernetes), where there is no
+// TTY: set GHOSTWIRE_PASSPHRASE directly, or GHOSTWIRE_PASSPHRASE_FILE to a
+// path (e.g. a mounted Secret) whose contents are the passphrase. A trailing
+// newline in the file is trimmed.
+// passphraseFromEnv reports whether a non-interactive passphrase source is set,
+// so callers can skip interactive confirmation.
+func passphraseFromEnv() bool {
+	if _, ok := os.LookupEnv("GHOSTWIRE_PASSPHRASE"); ok {
+		return true
+	}
+	return os.Getenv("GHOSTWIRE_PASSPHRASE_FILE") != ""
+}
+
+func resolvePassphrase(prompt string) (string, error) {
+	if p, ok := os.LookupEnv("GHOSTWIRE_PASSPHRASE"); ok {
+		return p, nil
+	}
+	if path := os.Getenv("GHOSTWIRE_PASSPHRASE_FILE"); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("read GHOSTWIRE_PASSPHRASE_FILE: %w", err)
+		}
+		return strings.TrimRight(string(data), "\r\n"), nil
+	}
+	return promptPassphrase(prompt)
 }
 
 // promptPassphrase prompts for a passphrase without echoing

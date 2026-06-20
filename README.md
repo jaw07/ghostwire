@@ -16,22 +16,33 @@ make test           # tests with race detector
 
 ```bash
 # Initialize mesh (generates CA, admin cert, encrypted config)
-ghostwire init --mesh-name ops --server-name vpn.example.com --listen :8443
-
-# Create enrollment token
-ghostwire enroll create --role operator --expires 1h
-
-# Join from another node
-ghostwire join --token gw_enroll_... --endpoint vpn.example.com:8443
+# --advertise sets the host:port enrolling nodes dial for the transport when it
+# differs from the local listen address (behind a tunnel/NAT). Optional.
+ghostwire init --mesh-name ops --server-name vpn.example.com --listen :8443 \
+  --advertise vpn.example.com:443
 
 # Start daemon (WireGuard tunnel + gossip + transport listener + GUI)
 ghostwire up -f
 
-# Emergency wipe (overwrite + rename + delete)
+# Create enrollment token against the RUNNING daemon (no passphrase, honored
+# immediately). enroll create still works offline against the encrypted config.
+ghostwire token create --role operator --expires 1h
+
+# Join from another node
+ghostwire join --token gw_enroll_... --endpoint vpn.example.com:8443
+
+# Emergency wipe (stops the daemon, then overwrite + rename + delete)
 ghostwire panic --wipe-all --force
 ```
 
-GUI runs on `:9999` with token auth. Printed at startup.
+GUI runs on `127.0.0.1:9999` (loopback only) with token auth, printed at startup.
+
+### Non-interactive / headless
+
+All commands that need the config passphrase read it from `GHOSTWIRE_PASSPHRASE`
+or `GHOSTWIRE_PASSPHRASE_FILE` (e.g. a mounted secret) before falling back to an
+interactive prompt — so `init`/`up`/`join`/`enroll`/`status`/`token` all run
+without a TTY. See [deploy/k8s](deploy/k8s/README.md) for a Kubernetes example.
 
 ## Architecture
 
@@ -175,7 +186,13 @@ Admin                                            New Node
   |                                                |    cert chains to ca_cert
 ```
 
-Step 5 prevents MITM: an attacker substituting a rogue CA would fail the fingerprint check because the mesh ID is embedded in the token signed by the real CA.
+Step 5 prevents MITM: an attacker substituting a rogue CA would fail the fingerprint check because the mesh ID is embedded in the token signed by the real CA. The node performs this verification **before** reading or storing any response data (mesh secret, assigned IP, peer list).
+
+Tokens can be minted two ways:
+- `ghostwire token create` — calls the **running daemon** over its loopback API. The token is added to the in-memory config, so the enrollment server honors it immediately (no restart) and the on-disk config is not decrypted a second time. Preferred for a live admin node.
+- `ghostwire enroll create` — decrypts the admin config offline and appends the token. Use when no daemon is running; a running daemon won't see the new token until it reloads.
+
+A node's advertised transport endpoint comes from `Transport.HTTPS.AdvertiseEndpoint` (set via `init --advertise`) when present, otherwise the admin host + transport port.
 
 ### Certificate renewal
 
@@ -231,6 +248,8 @@ WipeBytes(h[:])                      -- SHA-512 intermediate zeroed immediately
 ```
 
 The Ed25519 and X25519 keys are mathematically linked via the birational equivalence between the twisted Edwards curve (Ed25519) and the Montgomery curve (Curve25519). The conversion uses `edwards25519.ScalarBaseMult` followed by `BytesMontgomery()` for the Edwards-to-Montgomery point mapping.
+
+This shared keypair is **intentional and load-bearing**: a node's CA-signed Ed25519 certificate authenticates its WireGuard identity precisely because the WireGuard public key is the birational image of the certificate's Ed25519 public key (verified in `pki/verify.go`). Deriving the WireGuard key independently would sever that binding and break peer authentication. Using one Ed25519/X25519 pair for both signatures and Diffie-Hellman is a well-analyzed, accepted construction.
 
 ## Gossip
 
@@ -292,6 +311,8 @@ For incoming member M with incarnation I and state S:
 ## Policy engine
 
 Default-deny. Rules evaluated by priority descending, first match wins.
+
+The enforcer is wired into the WireGuard data path via a filtering TUN wrapper: every packet is evaluated on read (egress) and write (ingress). Enforcement defaults to **observe-only** — denied packets are logged but still pass — so enabling it cannot black-hole a mesh whose peers are still being discovered. Set `GHOSTWIRE_POLICY_ENFORCE=1` to actually drop denied packets. Peers are registered with the enforcer both from config and as they are discovered via gossip.
 
 ```yaml
 - name: operators-mesh-access
@@ -447,14 +468,17 @@ Alice                                            Bob
   |  kyber_ss = Kyber.Decapsulate(                 |
   |    kyber_ct, alice_kyber_priv)                 |
   |                                                |
-  |  shared = SHA-512(x25519_ss || kyber_ss)       |  64 bytes
-  |         = SHA-512(32 bytes  || 32 bytes)       |
+  |  shared = HKDF-SHA512(                          |  64 bytes
+  |    ikm  = x25519_ss || kyber_ss,                |
+  |    info = label || scheme || x25519_eph ||      |
+  |           kyber_ct || recipient_x25519 ||       |
+  |           recipient_kyber)                      |
   |                                                |
   |  encryption_key = shared[0:32]                 |  ChaCha20-Poly1305
   |  mac_key        = shared[32:64]                |
 ```
 
-Security: 128-bit classical (X25519) + 128-bit post-quantum (Kyber-768). Combined via SHA-512 ensures the stronger primitive dominates.
+Security: 128-bit classical (X25519) + 128-bit post-quantum (Kyber-768); both must break to recover the secret. The combined key is derived with **HKDF-SHA512 bound to the full handshake transcript** (scheme tag, ephemeral, ciphertext, and both recipient public keys), not a bare hash of the two shared secrets — so an active attacker cannot substitute KEM material without changing the derived key. Kyber/X25519 input lengths are validated before use, since the underlying KEM panics on malformed input (otherwise a remote DoS).
 
 ## NAT traversal
 
@@ -614,15 +638,29 @@ System IDs: 1-200 drones, 200-254 ground stations, 255 default GCS.
 ## Config
 
 age encryption, scrypt KDF (N=2^18, r=8, p=1), ChaCha20-Poly1305. No magic bytes.
+Note: the scrypt work factor needs ~256 MiB of RAM per decrypt/encrypt — size container memory limits accordingly.
 
 ```
 ~/.config/gw/
-  admin.enc    # admin config + CA key
-  config.enc   # node config
-  ca.crt       # CA certificate
+  admin.enc     # admin config + CA key
+  config.enc    # node config
+  ca.crt        # CA certificate
+  daemon-api    # loopback API URL + token, written by `up` for `token create`
 ```
 
+Relevant config fields / env vars:
+
+| Setting | Purpose |
+|---------|---------|
+| `transport.https.advertise_endpoint` | host:port enrolling nodes dial for the transport (`init --advertise`) |
+| `GHOSTWIRE_PASSPHRASE` / `GHOSTWIRE_PASSPHRASE_FILE` | non-interactive config passphrase |
+| `GHOSTWIRE_POLICY_ENFORCE=1` | drop policy-denied packets (default: observe-only) |
+
 Secure delete: random overwrite, zero overwrite, rename to random filename, unlink. Not effective on CoW filesystems (APFS, Btrfs).
+
+## Deployment
+
+`deploy/k8s/` has a Kubernetes manifest (ghostwire server + a Cloudflare `cloudflared` connector for enrollment) and a runbook. CI builds/tests on push; tagging `vX.Y.Z` publishes a multi-arch image to GHCR and release binaries (`.github/workflows`).
 
 ## Docker testing
 
