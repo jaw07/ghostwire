@@ -18,6 +18,18 @@ import (
 // 1. Hash the Ed25519 seed with SHA-512
 // 2. Apply X25519 clamping to the first 32 bytes (private key)
 // 3. Derive the public key via scalar multiplication
+//
+// DESIGN NOTE (intentional shared key): the resulting X25519/WireGuard scalar is
+// the same secret as the Ed25519 signing scalar. This is deliberate and load-
+// bearing: a node's CA-signed Ed25519 certificate authenticates its WireGuard
+// identity precisely because the WireGuard public key is the birational image of
+// the certificate's Ed25519 public key (see Ed25519PublicKeyToX25519 and
+// pki/verify.go's derivedWG check). Deriving the WireGuard key independently
+// (e.g. via a separate HKDF) would sever that binding and break peer
+// authentication. Using one Ed25519/X25519 key pair for both signatures and
+// Diffie-Hellman is a well-analyzed, accepted construction (it is what age and
+// several Ed25519-identity mesh VPNs do); the standard ScalarBaseMult/clamping
+// path below preserves its security properties.
 func Ed25519SeedToX25519(seed []byte) (privateKey [32]byte, publicKey [32]byte, err error) {
 	if len(seed) != 32 {
 		return privateKey, publicKey, ErrInvalidSeedLength

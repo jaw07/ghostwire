@@ -8,8 +8,19 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"time"
 
 	"github.com/ghostwire/ghostwire/internal/transport"
+)
+
+const (
+	// transientAcceptBackoff is the pause after a transient Accept error so a
+	// persistent failure cannot spin a CPU core.
+	transientAcceptBackoff = 10 * time.Millisecond
+
+	// knockReadTimeout bounds how long we wait for a client's initial knock
+	// request before giving up (slowloris protection).
+	knockReadTimeout = 10 * time.Second
 )
 
 // Transport implements the HTTPS-mimic obfuscation transport
@@ -266,6 +277,8 @@ func (l *httpsListener) acceptLoop() {
 				close(l.tunnelCh)
 				return
 			}
+			// Transient accept error — back off so we don't spin a CPU core.
+			time.Sleep(transientAcceptBackoff)
 			continue
 		}
 		go l.handleConnection(conn)
@@ -273,13 +286,16 @@ func (l *httpsListener) acceptLoop() {
 }
 
 func (l *httpsListener) handleConnection(conn net.Conn) {
-	// Read initial request to check for knock
+	// Read initial request to check for knock. Bound the read with a deadline
+	// so an idle/slowloris client cannot pin a goroutine + connection forever.
 	buf := make([]byte, 4096)
+	conn.SetReadDeadline(time.Now().Add(knockReadTimeout))
 	n, err := conn.Read(buf)
 	if err != nil {
 		conn.Close()
 		return
 	}
+	conn.SetReadDeadline(time.Time{}) // clear deadline for the tunnel lifetime
 
 	// Parse as HTTP request (simplified)
 	req, err := parseHTTPRequest(buf[:n])

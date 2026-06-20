@@ -20,7 +20,8 @@ import (
 type Device struct {
 	wgDevice   *device.Device
 	tunDevice  tun.Device
-	wgBind     conn.Bind // retained for listener management
+	filterTUN  *filteredTUN // wraps tunDevice; applies the policy packet filter
+	wgBind     conn.Bind    // retained for listener management
 	privateKey [32]byte
 	publicKey  [32]byte
 	meshIP     netip.Addr
@@ -62,6 +63,14 @@ type Config struct {
 
 	// HTTPS transport config (required if TransportMode is "https" or "hybrid")
 	HTTPSConfig *BindConfig
+}
+
+// SetPacketFilter attaches a PacketFilter (e.g. the policy enforcer) to the
+// data path. It may be called after the device is up; pass nil to disable
+// filtering. Packets read from the TUN are checked with direction "egress" and
+// packets written to the TUN with direction "ingress".
+func (d *Device) SetPacketFilter(filter PacketFilter) {
+	d.filterTUN.SetFilter(filter)
 }
 
 // DefaultConfig returns a Config with sensible defaults
@@ -130,8 +139,12 @@ func New(cfg *Config) (*Device, error) {
 		wgBind = conn.NewDefaultBind()
 	}
 
+	// Wrap the TUN so the policy enforcer can filter packets in both
+	// directions. With no filter attached this is a transparent pass-through.
+	filterTUN := newFilteredTUN(tunDev)
+
 	// Create WireGuard device
-	wgDev := device.NewDevice(tunDev, wgBind, logger)
+	wgDev := device.NewDevice(filterTUN, wgBind, logger)
 
 	// Configure private key
 	if err := wgDev.IpcSet(fmt.Sprintf("private_key=%s\n", keyToHex(cfg.PrivateKey[:]))); err != nil {
@@ -156,6 +169,7 @@ func New(cfg *Config) (*Device, error) {
 	d := &Device{
 		wgDevice:   wgDev,
 		tunDevice:  tunDev,
+		filterTUN:  filterTUN,
 		wgBind:     wgBind,
 		privateKey: cfg.PrivateKey,
 		publicKey:  publicKey,

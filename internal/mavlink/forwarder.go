@@ -6,6 +6,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // LinkConfig describes a named forwarding link between a local listen address
@@ -214,6 +215,7 @@ func (f *Forwarder) tcpAcceptLoop(l *link) {
 			case <-l.done:
 				return
 			default:
+				time.Sleep(transientReadBackoff)
 				continue
 			}
 		}
@@ -310,6 +312,7 @@ func (f *Forwarder) udpLoop(l *link) {
 				case <-l.done:
 					return
 				default:
+					time.Sleep(transientReadBackoff)
 					continue
 				}
 			}
@@ -338,6 +341,7 @@ func (f *Forwarder) udpLoop(l *link) {
 			case <-l.done:
 				return
 			default:
+				time.Sleep(transientReadBackoff)
 				continue
 			}
 		}

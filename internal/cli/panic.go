@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ghostwire/ghostwire/internal/config"
+	"github.com/ghostwire/ghostwire/internal/daemon"
 )
 
 func newPanicCmd() *cobra.Command {
@@ -84,9 +85,19 @@ func executePanic(configDir string, wipeConfig, wipeLogs, silent bool) error {
 		fmt.Println("Initiating emergency shutdown...")
 	}
 
-	// Signal daemon to stop (if running)
-	// TODO: When daemon IPC is implemented, signal immediate shutdown
-	// For now, just handle the wipe operations
+	// Terminate the running daemon (if any) BEFORE wiping key material, so all
+	// tunnels are torn down and in-memory keys go away with the process. SIGKILL
+	// is intentional — panic is an emergency stop, not a graceful shutdown.
+	dm := daemon.NewManager(configDir)
+	if running, _ := dm.IsRunning(); running {
+		if err := dm.ForceStop(); err != nil {
+			if !silent {
+				fmt.Printf("  Warning: could not stop daemon: %v\n", err)
+			}
+		} else if !silent {
+			fmt.Println("  Daemon terminated")
+		}
+	}
 
 	loader := config.NewLoader(configDir)
 	var errors []error

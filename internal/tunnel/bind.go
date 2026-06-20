@@ -26,25 +26,32 @@ import (
 // the length field from being used as a DPI fingerprint.
 type wsConn struct {
 	net.Conn
-	readBuf  []byte   // buffered payload from partially-read frame
-	lenMask  [2]byte  // per-session XOR mask for length field
-	isClient bool     // client frames are masked per RFC 6455
+	readBuf  []byte  // buffered payload from partially-read frame
+	lenMask  [2]byte // per-session XOR mask for length field
+	isClient bool    // client frames are masked per RFC 6455
 }
 
-func newWSConn(c net.Conn) *wsConn {
+func newWSConn(c net.Conn) (*wsConn, error) {
 	var mask [2]byte
-	rand.Read(mask[:])
+	if _, err := rand.Read(mask[:]); err != nil {
+		return nil, fmt.Errorf("generate length mask: %w", err)
+	}
 	w := &wsConn{Conn: c, lenMask: mask, isClient: true}
-	// Send the mask as the first 2 bytes so the peer can decode lengths
-	c.Write(mask[:])
-	return w
+	// Send the mask as the first 2 bytes so the peer can decode lengths.
+	// A failed write leaves the session desynced, so surface the error.
+	if _, err := c.Write(mask[:]); err != nil {
+		return nil, fmt.Errorf("send length mask: %w", err)
+	}
+	return w, nil
 }
 
-func newWSConnServer(c net.Conn) *wsConn {
+func newWSConnServer(c net.Conn) (*wsConn, error) {
 	// Read the client's length mask
 	var mask [2]byte
-	io.ReadFull(c, mask[:])
-	return &wsConn{Conn: c, lenMask: mask, isClient: false}
+	if _, err := io.ReadFull(c, mask[:]); err != nil {
+		return nil, fmt.Errorf("read length mask: %w", err)
+	}
+	return &wsConn{Conn: c, lenMask: mask, isClient: false}, nil
 }
 
 // Write wraps data in a WebSocket binary frame: 0x82 + length + mask + payload
@@ -202,6 +209,8 @@ type HTTPSBind struct {
 	remoteConns map[string]*httpsEndpoint // endpoint string -> connection
 	connsMu     sync.RWMutex
 	recvChan    chan recvPacket
+	done        chan struct{}  // closed by Close() to signal receive loops to stop
+	listeners   []net.Listener // server-side listeners, closed by Close()
 	closed      bool
 	closeMu     sync.Mutex
 }
@@ -278,6 +287,7 @@ func NewHTTPSBind(cfg *BindConfig) (*HTTPSBind, error) {
 		transport:   transport,
 		remoteConns: make(map[string]*httpsEndpoint),
 		recvChan:    make(chan recvPacket, 256),
+		done:        make(chan struct{}),
 	}
 
 	return b, nil
@@ -293,20 +303,26 @@ func (b *HTTPSBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	// Reopen if previously closed (WireGuard lifecycle: Close -> Open on Up)
 	if b.closed {
 		b.recvChan = make(chan recvPacket, 256)
+		b.done = make(chan struct{})
 		b.closed = false
 	}
 
-	// Create receive function
+	// Capture the current channels so the receive function is not racing with
+	// a concurrent Close/Open swapping the fields.
+	recvChan := b.recvChan
+	done := b.done
+
+	// Create receive function. recvChan is never closed (that would race with
+	// in-flight sends from receiveLoop); shutdown is signalled via done.
 	recvFunc := func(bufs [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
 		select {
-		case pkt, ok := <-b.recvChan:
-			if !ok {
-				return 0, io.EOF
-			}
+		case pkt := <-recvChan:
 			n := copy(bufs[0], pkt.data)
 			sizes[0] = n
 			eps[0] = pkt.endpoint
 			return 1, nil
+		case <-done:
+			return 0, io.EOF
 		}
 	}
 
@@ -326,7 +342,15 @@ func (b *HTTPSBind) Close() error {
 	}
 	b.closed = true
 
-	close(b.recvChan)
+	// Signal receive loops and receive funcs to stop. We never close recvChan
+	// itself: a receiveLoop may still be mid-send, and closing would panic.
+	close(b.done)
+
+	// Close any server-side listeners and stop their accept loops.
+	for _, ln := range b.listeners {
+		ln.Close()
+	}
+	b.listeners = nil
 
 	b.connsMu.Lock()
 	for _, ep := range b.remoteConns {
@@ -458,7 +482,12 @@ func (b *HTTPSBind) dialRaw(ctx context.Context, addr string) (net.Conn, error) 
 
 	// Wrap in WebSocket framing for DPI resistance.
 	// Post-knock traffic now looks like WebSocket binary frames.
-	return newWSConn(tlsConn), nil
+	ws, err := newWSConn(tlsConn)
+	if err != nil {
+		tlsConn.Close()
+		return nil, fmt.Errorf("websocket wrap: %w", err)
+	}
+	return ws, nil
 }
 
 // ParseEndpoint implements conn.Bind
@@ -472,6 +501,13 @@ func (b *HTTPSBind) BatchSize() int {
 }
 
 func (b *HTTPSBind) receiveLoop(ep *httpsEndpoint) {
+	// Capture the current channels under the lock so we are not racing with a
+	// concurrent Close/Open swapping the fields.
+	b.closeMu.Lock()
+	recvChan := b.recvChan
+	done := b.done
+	b.closeMu.Unlock()
+
 	// Receive loop for connection
 	buf := make([]byte, 65536)
 	for {
@@ -487,17 +523,13 @@ func (b *HTTPSBind) receiveLoop(ep *httpsEndpoint) {
 		data := make([]byte, n)
 		copy(data, buf[:n])
 
-		b.closeMu.Lock()
-		closed := b.closed
-		b.closeMu.Unlock()
-		if closed {
-			return
-		}
-
-		// Received packet
-
+		// Deliver the packet, but never block forever and never send on a
+		// channel after shutdown. done is closed by Close(); recvChan is never
+		// closed, so the send can never panic.
 		select {
-		case b.recvChan <- recvPacket{data: data, endpoint: ep}:
+		case <-done:
+			return
+		case recvChan <- recvPacket{data: data, endpoint: ep}:
 		default:
 			// Drop packet if channel full
 		}
@@ -542,8 +574,8 @@ func (b *DirectBind) BatchSize() int {
 
 // HybridBind supports both HTTPS and direct UDP connections
 type HybridBind struct {
-	httpsBind  *HTTPSBind
-	directBind *DirectBind
+	httpsBind   *HTTPSBind
+	directBind  *DirectBind
 	preferHTTPS bool
 }
 
@@ -671,10 +703,21 @@ func (b *HTTPSBind) StartListener(addr string, tlsConfig *tls.Config) error {
 		return fmt.Errorf("listen: %w", err)
 	}
 
+	// Track the listener so Close() can shut it down and stop the accept loop.
+	b.closeMu.Lock()
+	if b.closed {
+		b.closeMu.Unlock()
+		ln.Close()
+		return net.ErrClosed
+	}
+	b.listeners = append(b.listeners, ln)
+	b.closeMu.Unlock()
+
 	go func() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
+				// Listener closed (by Close) or fatal accept error: stop.
 				return
 			}
 			go b.handleIncoming(conn)
@@ -722,7 +765,11 @@ func (b *HTTPSBind) handleIncoming(c net.Conn) {
 	c.Write([]byte(wsResponse))
 
 	// Wrap in WebSocket framing — read the client's length mask first
-	wsConn := newWSConnServer(c)
+	wsConn, err := newWSConnServer(c)
+	if err != nil {
+		c.Close()
+		return
+	}
 
 	remoteAddr := c.RemoteAddr().String()
 

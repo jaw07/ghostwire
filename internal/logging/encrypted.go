@@ -185,27 +185,33 @@ func (l *EncryptedLogger) Flush() error {
 	}
 	entries := l.buffer
 	l.buffer = make([]*Entry, 0, l.bufferSize)
-	l.mu.Unlock()
 
-	// Check if rotation needed
+	// Check if rotation is needed while still holding the lock, so the
+	// l.file access here can't race with Close() setting l.file = nil.
 	if l.rotator != nil && l.file != nil {
-		info, err := l.file.Stat()
-		if err == nil && l.rotator.ShouldRotate(info.Size()) {
-			l.mu.Lock()
+		if info, err := l.file.Stat(); err == nil && l.rotator.ShouldRotate(info.Size()) {
 			l.file.Close()
 			l.rotator.Rotate(l.currentLogFilename())
 			l.openLogFile()
-			l.mu.Unlock()
 		}
 	}
+	l.mu.Unlock()
 
-	// Write entries
+	// Write entries (writeEntry takes l.mu internally, so the lock must be
+	// released here).
 	for _, entry := range entries {
 		if err := l.writeEntry(entry); err != nil {
 			return err
 		}
 	}
 
+	// Sync under the lock with a nil check: a concurrent Close() may have
+	// closed and nilled the file while we were writing.
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file == nil {
+		return nil
+	}
 	return l.file.Sync()
 }
 

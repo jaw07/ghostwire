@@ -13,8 +13,8 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"net"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -208,18 +208,11 @@ func joinMesh(tokenStr, endpoint, nodeName, configDir string) error {
 		return fmt.Errorf("parse response: %w", err)
 	}
 
-	fmt.Println("Enrollment successful!")
-	fmt.Println()
-	fmt.Printf("  Node ID:     %s\n", enrollResp.NodeID)
-	fmt.Printf("  Mesh:        %s\n", enrollResp.MeshName)
-	fmt.Printf("  Assigned IP: %s\n", enrollResp.AssignedIP)
-	fmt.Printf("  Roles:       %v\n", enrollResp.Roles)
-	fmt.Printf("  Peers:       %d\n", len(enrollResp.Peers))
-	fmt.Println()
-
-	// Verify the CA certificate matches the mesh ID from the enrollment token.
-	// The mesh ID is SHA-256(CA public key), so this pins the CA identity
-	// and prevents MITM attacks that substitute a rogue CA.
+	// Verify the CA identity and certificate chain BEFORE trusting or displaying
+	// any response data. The response carries the mesh secret, assigned IP, and
+	// peer list; the connection used InsecureSkipVerify, so reading or printing
+	// these before pinning the CA against the token's mesh ID would trust data
+	// from a potentially rogue CA (MITM). The mesh ID is SHA-256(CA public key).
 	fmt.Println("Verifying certificate chain and CA identity...")
 	if err := verifyCertificate(enrollResp.Certificate, enrollResp.CACertificate); err != nil {
 		return fmt.Errorf("certificate verification failed: %w", err)
@@ -228,6 +221,16 @@ func joinMesh(tokenStr, endpoint, nodeName, configDir string) error {
 		return fmt.Errorf("CA identity verification failed (possible MITM): %w", err)
 	}
 	fmt.Println("  CA identity verified against enrollment token")
+	fmt.Println()
+
+	fmt.Println("Enrollment successful!")
+	fmt.Println()
+	fmt.Printf("  Node ID:     %s\n", enrollResp.NodeID)
+	fmt.Printf("  Mesh:        %s\n", enrollResp.MeshName)
+	fmt.Printf("  Assigned IP: %s\n", enrollResp.AssignedIP)
+	fmt.Printf("  Roles:       %v\n", enrollResp.Roles)
+	fmt.Printf("  Peers:       %d\n", len(enrollResp.Peers))
+	fmt.Println()
 
 	// Build and save config
 	fmt.Println("Saving configuration...")
@@ -260,7 +263,7 @@ func joinMesh(tokenStr, endpoint, nodeName, configDir string) error {
 				}
 			}
 			if len(enrollResp.Peers[i].Endpoints) == 0 {
-				enrollResp.Peers[i].Endpoints = []string{net.JoinHostPort(adminHost, "8444")}
+				enrollResp.Peers[i].Endpoints = []string{net.JoinHostPort(adminHost, transportPortFromConfig(enrollResp.TransportConfig))}
 			}
 		} else {
 			// Non-admin peers: remove 0.0.0.0 endpoints, they'll be discovered via gossip
@@ -319,6 +322,19 @@ func joinMesh(tokenStr, endpoint, nodeName, configDir string) error {
 	fmt.Println("  Run 'ghostwire up' to start the daemon and connect to the mesh")
 
 	return nil
+}
+
+// transportPortFromConfig returns the WireGuard transport port advertised in
+// the mesh transport config, falling back to "8444" if it is unset/unparseable.
+// This avoids hardcoding the port so a non-default TransportListenAddr is
+// honored when synthesizing the admin peer endpoint.
+func transportPortFromConfig(tc config.TransportConfig) string {
+	if addr := tc.HTTPS.TransportListenAddr; addr != "" {
+		if _, p, err := net.SplitHostPort(addr); err == nil && p != "" {
+			return p
+		}
+	}
+	return "8444"
 }
 
 // verifyCAFingerprint checks that the CA certificate's public key hash matches

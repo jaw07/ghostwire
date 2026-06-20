@@ -3,6 +3,7 @@ package policy
 import (
 	"encoding/binary"
 	"net/netip"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -340,6 +341,9 @@ func (ct *ConnectionTracker) cleanup() {
 }
 
 func connKey(srcIP, dstIP netip.Addr, srcPort, dstPort uint16, protocol string) string {
-	return srcIP.String() + ":" + string(rune(srcPort)) + "->" +
-		dstIP.String() + ":" + string(rune(dstPort)) + "/" + protocol
+	// strconv.Itoa, not string(rune(port)): a rune conversion turns ports >127
+	// into multi-byte UTF-8 and lets distinct ports collide, corrupting the
+	// connection-tracking key.
+	return srcIP.String() + ":" + strconv.Itoa(int(srcPort)) + "->" +
+		dstIP.String() + ":" + strconv.Itoa(int(dstPort)) + "/" + protocol
 }

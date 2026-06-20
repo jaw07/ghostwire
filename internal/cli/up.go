@@ -16,11 +16,11 @@ import (
 	"fmt"
 	"math/big"
 	"net"
-	"strings"
 	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -286,13 +286,13 @@ func startDaemon(configDir string, foreground bool) error {
 
 	// Initialize gossip protocol
 	gossipCfg := &gossip.Config{
-		BindAddr:       ":" + gossipPort,
-		GossipInterval: 1 * time.Second,
+		BindAddr:         ":" + gossipPort,
+		GossipInterval:   1 * time.Second,
 		ProbeInterval:    2 * time.Second,
-		ProbeTimeout:    3 * time.Second,
+		ProbeTimeout:     3 * time.Second,
 		SuspicionTimeout: 15 * time.Second,
-		IndirectChecks:  3,
-		MeshSecret:      meshSecret,
+		IndirectChecks:   3,
+		MeshSecret:       meshSecret,
 	}
 
 	fmt.Printf("  Self gossip endpoint: %s\n", selfGossipAddr)
@@ -313,7 +313,10 @@ func startDaemon(configDir string, foreground bool) error {
 	// Create GUI server early so gossip callbacks can reference it
 	fmt.Println("Starting GUI server...")
 	guiCfg := &gui.Config{
-		ListenAddr: "0.0.0.0:9999",
+		// Bind the management API to loopback only. It exposes peer/chat/MAVLink
+		// control with token auth but no transport encryption; 0.0.0.0 would
+		// expose it to the entire underlay network.
+		ListenAddr: "127.0.0.1:9999",
 		AutoOpen:   false,
 	}
 	guiServer, guiErr := gui.New(guiCfg)
@@ -415,12 +418,61 @@ func startDaemon(configDir string, foreground bool) error {
 	}
 	fmt.Println("  MAVLink forwarder initialized")
 
+	// Transport port used when rewriting gossip-advertised endpoints (which
+	// carry the gossip port) into WireGuard transport endpoints. Derived from
+	// config so it tracks a non-default TransportListenAddr instead of a
+	// hardcoded ":8444".
+	transportPort := "8444"
+	if a := meshConfig.Transport.HTTPS.TransportListenAddr; a != "" {
+		if _, p, err := net.SplitHostPort(a); err == nil && p != "" {
+			transportPort = p
+		}
+	}
+
+	// Initialize policy engine + enforcer before wiring gossip callbacks, so
+	// gossip-discovered peers can be registered with the enforcer as they join.
+	policyEngine, err := policy.NewEngine()
+	if err != nil {
+		return fmt.Errorf("init policy engine: %w", err)
+	}
+	defaultPolicies := policy.DefaultPolicies()
+	if err := policyEngine.LoadPolicies(defaultPolicies); err != nil {
+		return fmt.Errorf("load policies: %w", err)
+	}
+	fmt.Println("  Policy engine initialized")
+
+	enforcer := policy.NewEnforcer(policyEngine, meshConfig.NodeID, meshConfig.Roles, meshConfig.Compartment)
+	enforcer.SetOnDeny(func(req *policy.Request, dec *policy.Decision) {
+		fmt.Printf("  DENIED: %s -> %s:%d (%s)\n",
+			req.SourceNodeID, req.DestNodeID, req.DestPort, dec.Reason)
+	})
+
+	// Register peers known from config with the enforcer.
+	for _, peerCfg := range meshConfig.Peers {
+		peerIP, _ := netip.ParseAddr(peerCfg.MeshIP)
+		enforcer.RegisterPeer(&policy.PeerInfo{
+			NodeID: peerCfg.NodeID,
+			Roles:  peerCfg.Roles,
+			MeshIP: peerIP,
+		})
+	}
+	fmt.Println("  Policy enforcer initialized")
+
 	// Set up gossip callbacks to update routing + GUI + knock validator + WG peers
 	gossipService.Members().SetCallbacks(
 		func(m *gossip.Member) {
 			fmt.Printf("  Peer joined: %s (%s)\n", m.NodeID, m.MeshIP)
 			routeTable.UpdateFromGossip(gossipService.Members())
 			updateGUIPeers()
+			// Register the peer with the policy enforcer so its role/IP are known
+			// when evaluating data-path packets.
+			if peerIP, perr := netip.ParseAddr(m.MeshIP.String()); perr == nil {
+				enforcer.RegisterPeer(&policy.PeerInfo{
+					NodeID: m.NodeID,
+					Roles:  m.Roles,
+					MeshIP: peerIP,
+				})
+			}
 			// Register the new peer's WG public key for knock auth + WireGuard
 			if m.PublicKey != "" && m.NodeID != meshConfig.NodeID {
 				if keyBytes, err := base64.StdEncoding.DecodeString(m.PublicKey); err == nil {
@@ -435,7 +487,7 @@ func startDaemon(configDir string, foreground bool) error {
 							// Use transport port, not gossip port
 							h, _, splitErr := net.SplitHostPort(ep)
 							if splitErr == nil {
-								ep = net.JoinHostPort(h, "8444")
+								ep = net.JoinHostPort(h, transportPort)
 							}
 						}
 						peer := tunnel.NewPeer(&tunnel.PeerConfig{
@@ -466,36 +518,18 @@ func startDaemon(configDir string, foreground bool) error {
 		},
 	)
 
-	// Initialize policy engine
-	policyEngine, err := policy.NewEngine()
-	if err != nil {
-		return fmt.Errorf("init policy engine: %w", err)
+	// Attach the enforcer to the WireGuard data path. Every packet is now
+	// evaluated against policy. Enforcement defaults to observe-only so wiring
+	// the filter cannot black-hole a mesh whose peers are still being
+	// discovered (default-deny + unregistered peers would drop all traffic);
+	// set GHOSTWIRE_POLICY_ENFORCE=1 to actually drop denied packets.
+	enforce := os.Getenv("GHOSTWIRE_POLICY_ENFORCE") == "1"
+	dev.SetPacketFilter(policyFilter{enforcer: enforcer, enforce: enforce})
+	if enforce {
+		fmt.Println("  Policy enforcement: ENFORCING (denied packets dropped)")
+	} else {
+		fmt.Println("  Policy enforcement: observe-only (set GHOSTWIRE_POLICY_ENFORCE=1 to drop denied packets)")
 	}
-
-	// Load default policies
-	defaultPolicies := policy.DefaultPolicies()
-	if err := policyEngine.LoadPolicies(defaultPolicies); err != nil {
-		return fmt.Errorf("load policies: %w", err)
-	}
-	fmt.Println("  Policy engine initialized")
-
-	// Initialize policy enforcer
-	enforcer := policy.NewEnforcer(policyEngine, meshConfig.NodeID, meshConfig.Roles, meshConfig.Compartment)
-	enforcer.SetOnDeny(func(req *policy.Request, dec *policy.Decision) {
-		fmt.Printf("  DENIED: %s -> %s:%d (%s)\n",
-			req.SourceNodeID, req.DestNodeID, req.DestPort, dec.Reason)
-	})
-
-	// Register known peers with enforcer
-	for _, peerCfg := range meshConfig.Peers {
-		peerIP, _ := netip.ParseAddr(peerCfg.MeshIP)
-		enforcer.RegisterPeer(&policy.PeerInfo{
-			NodeID: peerCfg.NodeID,
-			Roles:  peerCfg.Roles,
-			MeshIP: peerIP,
-		})
-	}
-	fmt.Println("  Policy enforcer initialized")
 
 	// Initialize certificate renewal service (for non-admin nodes)
 	var renewalService *pki.RenewalService
@@ -834,16 +868,73 @@ func parsePrivateKey(pemData string) ([]byte, error) {
 	}
 }
 
-// detectOutboundIP finds this host's preferred outbound IP by dialing a
-// dummy UDP address and checking the local address chosen by the OS.
-func detectOutboundIP() string {
-	conn, err := net.Dial("udp4", "8.8.8.8:53")
-	if err != nil {
-		return "127.0.0.1"
+// policyFilter adapts the policy enforcer to the tunnel data path
+// (tunnel.PacketFilter). In observe-only mode it evaluates and logs denials
+// but still allows the packet; in enforce mode it drops denied packets.
+type policyFilter struct {
+	enforcer *policy.Enforcer
+	enforce  bool
+}
+
+func (p policyFilter) Allow(packet []byte, direction string) bool {
+	if p.enforcer.CheckPacket(packet, direction) == policy.VerdictAllow {
+		return true
 	}
-	defer conn.Close()
-	addr := conn.LocalAddr().(*net.UDPAddr)
-	return addr.IP.String()
+	// Denied: the enforcer's OnDeny callback has already logged it.
+	return !p.enforce
+}
+
+// detectOutboundIP finds this host's preferred outbound IPv4 address.
+//
+// It enumerates local interfaces rather than referencing a public resolver:
+// ghostwire is built for contested/air-gapped networks where 8.8.8.8 is
+// unreachable, and a failed dial there silently produced 127.0.0.1 — which
+// then became the gossip advertise IP and a TLS cert SAN, breaking mesh
+// formation. Private addresses (the typical mesh underlay) are preferred.
+func detectOutboundIP() string {
+	ifaces, err := net.Interfaces()
+	if err == nil {
+		var candidate string
+		for _, iface := range ifaces {
+			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			addrs, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, a := range addrs {
+				ipNet, ok := a.(*net.IPNet)
+				if !ok {
+					continue
+				}
+				ip4 := ipNet.IP.To4()
+				if ip4 == nil || ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+					continue
+				}
+				if ip4.IsPrivate() {
+					return ip4.String() // best fit for a mesh underlay
+				}
+				if candidate == "" {
+					candidate = ip4.String()
+				}
+			}
+		}
+		if candidate != "" {
+			return candidate
+		}
+	}
+
+	// Last resort: consult the routing table via a UDP socket to an RFC 5737
+	// documentation address (never routed off-link, no packet is sent).
+	if conn, err := net.Dial("udp4", "203.0.113.1:9"); err == nil {
+		defer conn.Close()
+		if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && !addr.IP.IsLoopback() {
+			return addr.IP.String()
+		}
+	}
+
+	return "127.0.0.1"
 }
 
 // addPeerFromConfig adds a peer from the config
