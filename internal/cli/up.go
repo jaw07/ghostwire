@@ -92,8 +92,9 @@ func startDaemon(configDir string, foreground bool) error {
 		return fmt.Errorf("no configuration found at %s\nRun 'ghostwire init' or 'ghostwire join' first", configDir)
 	}
 
-	// Prompt for passphrase
-	passphrase, err := promptPassphrase("Enter passphrase: ")
+	// Resolve passphrase: non-interactive (GHOSTWIRE_PASSPHRASE[_FILE]) for
+	// headless/k8s daemons, otherwise prompt.
+	passphrase, err := resolvePassphrase("Enter passphrase: ")
 	if err != nil {
 		return fmt.Errorf("read passphrase: %w", err)
 	}
