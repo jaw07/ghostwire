@@ -89,7 +89,7 @@ func showStatus(configDir string, jsonOutput bool) error {
 	status.State = "configured"
 
 	// Try to show config info (requires passphrase)
-	passphrase, err := promptPassphrase("Enter passphrase to view full status (or press Enter to skip): ")
+	passphrase, err := resolvePassphrase("Enter passphrase to view full status (or press Enter to skip): ")
 	if err != nil || passphrase == "" {
 		// Show limited status without decryption
 		if jsonOutput {

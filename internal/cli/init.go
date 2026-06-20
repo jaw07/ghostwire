@@ -21,12 +21,13 @@ import (
 
 func newInitCmd() *cobra.Command {
 	var (
-		meshName   string
-		outputDir  string
-		subnet     string
-		nodeID     string
-		serverName string
-		listenAddr string
+		meshName          string
+		outputDir         string
+		subnet            string
+		nodeID            string
+		serverName        string
+		listenAddr        string
+		advertiseEndpoint string
 	)
 
 	cmd := &cobra.Command{
@@ -62,7 +63,7 @@ The admin config will be saved to the output directory.`,
 				}
 			}
 
-			return initializeMesh(meshName, outputDir, subnet, nodeID, serverName, listenAddr, passphrase)
+			return initializeMesh(meshName, outputDir, subnet, nodeID, serverName, listenAddr, advertiseEndpoint, passphrase)
 		},
 	}
 
@@ -72,11 +73,12 @@ The admin config will be saved to the output directory.`,
 	cmd.Flags().StringVar(&nodeID, "node-id", "", "node ID for the admin node (default: hostname)")
 	cmd.Flags().StringVar(&serverName, "server-name", "", "TLS server name (SNI) for HTTPS transport")
 	cmd.Flags().StringVar(&listenAddr, "listen", ":443", "listen address for HTTPS transport")
+	cmd.Flags().StringVar(&advertiseEndpoint, "advertise", "", "host:port enrolling nodes should dial for the transport (e.g. behind a tunnel/NAT)")
 
 	return cmd
 }
 
-func initializeMesh(meshName, outputDir, subnet, nodeID, serverName, listenAddr, passphrase string) error {
+func initializeMesh(meshName, outputDir, subnet, nodeID, serverName, listenAddr, advertiseEndpoint, passphrase string) error {
 	// Set defaults
 	if outputDir == "" {
 		home, err := os.UserHomeDir()
@@ -183,6 +185,7 @@ func initializeMesh(meshName, outputDir, subnet, nodeID, serverName, listenAddr,
 				Active: "https-mimic",
 				HTTPS: config.HTTPSTransportConfig{
 					ServerName:          serverName,
+					AdvertiseEndpoint:   advertiseEndpoint,
 					Fingerprint:         "auto",
 					ListenAddr:          listenAddr,
 					TransportListenAddr: ":8444",

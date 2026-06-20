@@ -295,19 +295,20 @@ func joinMesh(tokenStr, endpoint, nodeName, configDir string) error {
 		CertRenewalThreshold: 6 * time.Hour,
 	}
 
-	// Prompt for passphrase
-	passphrase, err := promptPassphrase("Create passphrase for local config: ")
+	// Passphrase for the local config: non-interactive source if set, else
+	// prompt with confirmation.
+	passphrase, err := resolvePassphrase("Create passphrase for local config: ")
 	if err != nil {
 		return fmt.Errorf("read passphrase: %w", err)
 	}
-
-	passphrase2, err := promptPassphrase("Confirm passphrase: ")
-	if err != nil {
-		return fmt.Errorf("read passphrase: %w", err)
-	}
-
-	if passphrase != passphrase2 {
-		return fmt.Errorf("passphrases do not match")
+	if !passphraseFromEnv() {
+		passphrase2, err := promptPassphrase("Confirm passphrase: ")
+		if err != nil {
+			return fmt.Errorf("read passphrase: %w", err)
+		}
+		if passphrase != passphrase2 {
+			return fmt.Errorf("passphrases do not match")
+		}
 	}
 
 	if err := loader.SaveConfig(meshConfig, passphrase); err != nil {

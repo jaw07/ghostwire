@@ -89,6 +89,8 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.handleCreateMAVLinkLink(w, r)
 	case path == "/mavlink/links" && r.Method == "DELETE":
 		a.handleDeleteMAVLinkLink(w, r)
+	case path == "/enroll/token" && r.Method == "POST":
+		a.handleCreateEnrollToken(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -255,6 +257,42 @@ func (a *API) SetMAVLinkLinks(links []map[string]interface{}) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.mavlinkLinks = links
+}
+
+// handleCreateEnrollToken creates a new enrollment token via the running
+// daemon (loopback + auth). This avoids decrypting the admin config a second
+// time and is seen by the enrollment server immediately.
+func (a *API) handleCreateEnrollToken(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Roles          []string `json:"roles"`
+		MaxUses        int      `json:"max_uses"`
+		ExpiresSeconds int      `json:"expires_seconds"`
+		Name           string   `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		a.writeError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if a.server == nil || a.server.onCreateToken == nil {
+		a.writeError(w, http.StatusServiceUnavailable, "enrollment not available on this node")
+		return
+	}
+
+	expires := time.Duration(req.ExpiresSeconds) * time.Second
+	if expires <= 0 {
+		expires = time.Hour
+	}
+	maxUses := req.MaxUses
+	if maxUses == 0 {
+		maxUses = 1
+	}
+
+	tokenStr, err := a.server.onCreateToken(req.Roles, expires, maxUses, req.Name)
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	a.writeJSON(w, map[string]string{"token": tokenStr})
 }
 
 // writeJSON writes a JSON response

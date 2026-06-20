@@ -701,6 +701,21 @@ func startDaemon(configDir string, foreground bool) error {
 		// Set initial peers from config
 		updateGUIPeers()
 
+		// Expose enrollment-token creation through the loopback API so tokens can
+		// be minted against the running daemon (in-memory, no restart/scrypt).
+		if enrollServer != nil {
+			guiServer.SetEnrollHandler(func(roles []string, expires time.Duration, maxUses int, name string) (string, error) {
+				return enrollServer.CreateToken(roles, expires, maxUses, name)
+			})
+			// Persist the loopback API endpoint + token so `ghostwire token
+			// create` (and `kubectl exec`) can reach the daemon without the
+			// config passphrase.
+			apiInfo := fmt.Sprintf("http://%s\n%s\n", guiCfg.ListenAddr, guiServer.AuthToken())
+			if err := os.WriteFile(filepath.Join(configDir, "daemon-api"), []byte(apiInfo), 0600); err != nil {
+				fmt.Printf("Warning: could not write daemon-api file: %v\n", err)
+			}
+		}
+
 		go func() {
 			if err := guiServer.Start(); err != nil {
 				fmt.Printf("GUI server error: %v\n", err)

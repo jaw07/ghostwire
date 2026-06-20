@@ -49,6 +49,7 @@ func init() {
 		newUpCmd(),
 		newDownCmd(),
 		newStatusCmd(),
+		newTokenCmd(),
 		newPanicCmd(),
 	)
 }

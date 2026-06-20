@@ -89,7 +89,7 @@ func createEnrollmentToken(configDir string, roles []string, expires time.Durati
 	}
 
 	// Prompt for passphrase
-	passphrase, err := promptPassphrase("Enter passphrase to unlock admin config: ")
+	passphrase, err := resolvePassphrase("Enter passphrase to unlock admin config: ")
 	if err != nil {
 		return fmt.Errorf("read passphrase: %w", err)
 	}
@@ -204,7 +204,7 @@ func listEnrollmentTokens(configDir string) error {
 	}
 
 	// Prompt for passphrase
-	passphrase, err := promptPassphrase("Enter passphrase: ")
+	passphrase, err := resolvePassphrase("Enter passphrase: ")
 	if err != nil {
 		return fmt.Errorf("read passphrase: %w", err)
 	}
@@ -284,7 +284,7 @@ func revokeEnrollmentToken(configDir, tokenIDPrefix string) error {
 	}
 
 	// Prompt for passphrase
-	passphrase, err := promptPassphrase("Enter passphrase: ")
+	passphrase, err := resolvePassphrase("Enter passphrase: ")
 	if err != nil {
 		return fmt.Errorf("read passphrase: %w", err)
 	}

@@ -101,16 +101,26 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
+              # Stale PID file from a previous pod (always PID 1 in a container)
+              # would make `up` think a daemon is already running. Clear it.
+              rm -f /etc/ghostwire/ghostwire.pid
+
               if [ ! -f /etc/ghostwire/admin.enc ]; then
                 echo "no admin config — initializing mesh"
+                # --advertise: enrolling nodes dial the transport via the
+                # Cloudflare tunnel hostname on :443, not the local :8444.
                 ghostwire init --mesh-name ghostwire-mesh \
                   --subnet 10.100.0.0/16 \
                   --server-name gwt.dronedocs.net \
                   --listen :8443 \
+                  --advertise gwt.dronedocs.net:443 \
                   --output /etc/ghostwire
               else
                 echo "admin config present — skipping init"
               fi
+              # Enrollment tokens are now minted against the running daemon:
+              #   kubectl -n ghostwire exec deploy/ghostwire -c ghostwire -- \
+              #     ghostwire token create -c /etc/ghostwire --role operator
           env:
             - name: GHOSTWIRE_PASSPHRASE
               valueFrom:
@@ -118,10 +128,10 @@ spec:
           volumeMounts:
             - { name: config, mountPath: /etc/ghostwire }
           resources:
-            # scrypt config encryption (work factor 2^18) needs ~256 MiB for the
-            # KDF alone — headroom required or the init is OOMKilled.
+            # init + enroll create do scrypt decrypt AND re-encrypt (2^18, ~256
+            # MiB each, can overlap) — needs ~1 GiB headroom.
             requests: { cpu: 100m, memory: 320Mi }
-            limits: { memory: 512Mi }
+            limits: { memory: 1Gi }
       containers:
         - name: ghostwire
           image: docker.io/library/ghostwire:dev
@@ -145,9 +155,10 @@ spec:
             - { name: config, mountPath: /etc/ghostwire }
             - { name: tun, mountPath: /dev/net/tun }
           resources:
-            # scrypt config decryption on startup needs ~256 MiB for the KDF.
+            # scrypt config decryption needs ~256 MiB for the KDF; headroom for
+            # an additional concurrent decrypt (e.g. `enroll create` via exec).
             requests: { cpu: 100m, memory: 320Mi }
-            limits: { memory: 512Mi }
+            limits: { memory: 1Gi }
       volumes:
         - name: config
           persistentVolumeClaim: { claimName: ghostwire-config }

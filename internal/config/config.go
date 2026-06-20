@@ -20,9 +20,9 @@ type MeshConfig struct {
 	Compartment string   `yaml:"compartment,omitempty"`
 
 	// PKI material (PEM-encoded)
-	NodePrivateKey  string `yaml:"node_private_key"`  // Ed25519 seed in PEM
-	NodeCertificate string `yaml:"node_certificate"`  // X.509 certificate
-	CACertChain     string `yaml:"ca_cert_chain"`     // CA certificate chain
+	NodePrivateKey  string `yaml:"node_private_key"` // Ed25519 seed in PEM
+	NodeCertificate string `yaml:"node_certificate"` // X.509 certificate
+	CACertChain     string `yaml:"ca_cert_chain"`    // CA certificate chain
 
 	// Network configuration
 	MeshSubnet string `yaml:"mesh_subnet"` // e.g., "10.gw.0.0/16"
@@ -88,6 +88,13 @@ type HTTPSTransportConfig struct {
 
 	// Listen address for WireGuard transport connections (separate from enrollment)
 	TransportListenAddr string `yaml:"transport_listen_addr,omitempty"`
+
+	// AdvertiseEndpoint is the host:port that enrolling nodes should dial to
+	// reach this node's WireGuard transport. Set this when the transport is
+	// reached via a different address than the local listen address — e.g.
+	// behind a Cloudflare tunnel ("gwt.example.com:443") or a NAT. When empty,
+	// peers fall back to the admin host + transport port.
+	AdvertiseEndpoint string `yaml:"advertise_endpoint,omitempty"`
 }
 
 // QUICTransportConfig configures the QUIC transport
@@ -147,9 +154,9 @@ type AdminConfig struct {
 
 // IPAllocatorState tracks IP address allocation within the mesh
 type IPAllocatorState struct {
-	Subnet    string            `yaml:"subnet"`     // e.g., "10.100.0.0/16"
-	Allocated map[string]string `yaml:"allocated"`  // node_id -> IP
-	NextIP    string            `yaml:"next_ip"`    // Next IP to allocate
+	Subnet    string            `yaml:"subnet"`    // e.g., "10.100.0.0/16"
+	Allocated map[string]string `yaml:"allocated"` // node_id -> IP
+	NextIP    string            `yaml:"next_ip"`   // Next IP to allocate
 }
 
 // StoredToken represents an enrollment token stored in admin config

@@ -136,6 +136,34 @@ func makeEnrollBody(t *testing.T, tokenStr string) []byte {
 // Tests
 // ---------------------------------------------------------------------------
 
+func TestCreateTokenImmediatelyEnrollable(t *testing.T) {
+	ts := newTestSetup(t, 1)
+	before := len(ts.adminConfig.EnrollmentTokens)
+
+	tokenStr, err := ts.server.CreateToken([]string{"operator"}, 10*time.Minute, 3, "newnode")
+	if err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+	if tokenStr == "" {
+		t.Fatal("expected a non-empty token")
+	}
+
+	// Must be added to the live in-memory config so the running server honors it.
+	if got := len(ts.adminConfig.EnrollmentTokens); got != before+1 {
+		t.Fatalf("EnrollmentTokens = %d, want %d", got, before+1)
+	}
+
+	// And it must be enrollable right away — no restart/reload.
+	body := makeEnrollBody(t, tokenStr)
+	req := httptest.NewRequest(http.MethodPost, "/enroll", bytes.NewReader(body))
+	req.RemoteAddr = "10.0.0.9:5555"
+	rec := httptest.NewRecorder()
+	ts.server.handleEnroll(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("enroll with daemon-created token: status %d, body %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestNewEnrollmentServer(t *testing.T) {
 	ts := newTestSetup(t, 1)
 	if ts.server == nil {

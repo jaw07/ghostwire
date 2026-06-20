@@ -353,6 +353,48 @@ func (s *EnrollmentServer) handleEnroll(w http.ResponseWriter, r *http.Request) 
 	json.NewEncoder(w).Encode(resp)
 }
 
+// CreateToken generates a new enrollment token against the live, in-memory
+// admin config. Because the running enrollment server shares this same config,
+// the token is honored immediately — no daemon restart and no second scrypt
+// decrypt of the on-disk config (the prior out-of-band `enroll create` flow
+// required both). The updated config is persisted via saveConfig.
+func (s *EnrollmentServer) CreateToken(roles []string, expires time.Duration, maxUses int, nodeName string) (string, error) {
+	if len(roles) == 0 {
+		roles = []string{"operator"}
+	}
+
+	generator := token.NewGenerator(s.ca.RootKey(), s.ca.MeshID)
+	tokenStr, tok, err := generator.Generate(&token.GeneratorOptions{
+		Roles:         roles,
+		Expiry:        expires,
+		MaxUses:       maxUses,
+		SuggestedName: nodeName,
+	})
+	if err != nil {
+		return "", fmt.Errorf("generate token: %w", err)
+	}
+
+	s.configMu.Lock()
+	s.adminConfig.EnrollmentTokens = append(s.adminConfig.EnrollmentTokens, config.StoredToken{
+		TokenID:   hex.EncodeToString(tok.ID[:]),
+		CreatedAt: time.Now(),
+		ExpiresAt: tok.NotAfter,
+		Roles:     roles,
+		MaxUses:   maxUses,
+		UsedCount: 0,
+	})
+	var saveErr error
+	if s.saveConfig != nil {
+		saveErr = s.saveConfig(s.adminConfig)
+	}
+	s.configMu.Unlock()
+
+	if saveErr != nil {
+		return "", fmt.Errorf("persist token: %w", saveErr)
+	}
+	return tokenStr, nil
+}
+
 func (s *EnrollmentServer) getCAPublicKey() ed25519.PublicKey {
 	// Extract public key from CA certificate
 	return s.ca.RootCert.PublicKey.(ed25519.PublicKey)
@@ -477,6 +519,12 @@ func (s *EnrollmentServer) getAdminWGPubKey() string {
 }
 
 func (s *EnrollmentServer) getAdminEndpoints() []string {
+	// A configured advertise endpoint (e.g. a Cloudflare tunnel hostname) wins:
+	// it is the address enrolling nodes can actually reach, which may differ
+	// from the local listen address.
+	if s.adminConfig.Transport.HTTPS.AdvertiseEndpoint != "" {
+		return []string{s.adminConfig.Transport.HTTPS.AdvertiseEndpoint}
+	}
 	// Return the transport listener address (for WireGuard tunnel connections),
 	// not the enrollment server address
 	if s.adminConfig.Transport.HTTPS.TransportListenAddr != "" {

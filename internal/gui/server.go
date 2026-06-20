@@ -20,25 +20,26 @@ var webAssets embed.FS
 
 // Server is the GUI HTTP server
 type Server struct {
-	mu           sync.RWMutex
-	config       *Config
-	httpServer   *http.Server
-	listener     net.Listener
-	api          *API
-	wsHub        *Hub
-	authToken    string
+	mu              sync.RWMutex
+	config          *Config
+	httpServer      *http.Server
+	listener        net.Listener
+	api             *API
+	wsHub           *Hub
+	authToken       string
 	running         bool
 	onChatSend      func(text string)
 	onMAVLinkCreate func(name, protocol, listen, target string) error
 	onMAVLinkDelete func(name string) error
+	onCreateToken   func(roles []string, expires time.Duration, maxUses int, name string) (string, error)
 }
 
 // Config configures the GUI server
 type Config struct {
-	ListenAddr string        // Default: "127.0.0.1:9999"
-	AuthToken  string        // If empty, generated randomly
-	AutoOpen   bool          // Open browser on start
-	DaemonAddr string        // Daemon RPC address (if separate)
+	ListenAddr string // Default: "127.0.0.1:9999"
+	AuthToken  string // If empty, generated randomly
+	AutoOpen   bool   // Open browser on start
+	DaemonAddr string // Daemon RPC address (if separate)
 }
 
 // DefaultConfig returns default configuration
@@ -249,6 +250,14 @@ func (s *Server) BroadcastMAVLinkLinks(links interface{}) {
 		s.api.SetMAVLinkLinks(typedLinks)
 	}
 	s.Broadcast("mavlink_links", links)
+}
+
+// SetEnrollHandler sets the callback invoked to create an enrollment token via
+// the loopback API (delegated to the running enrollment server).
+func (s *Server) SetEnrollHandler(handler func(roles []string, expires time.Duration, maxUses int, name string) (string, error)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onCreateToken = handler
 }
 
 // SetChatHandler sets the callback invoked when a client sends a chat message
