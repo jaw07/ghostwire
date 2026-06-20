@@ -61,10 +61,11 @@ kubectl -n ghostwire logs deploy/ghostwire | grep -E "Tunnel active|listener|gos
 ## 5. Enroll a client
 
 ```sh
-# admin side: create an enrollment token
-kubectl -n ghostwire exec deploy/ghostwire -- ghostwire enroll create-token -c /etc/ghostwire
-# client side:
-ghostwire join --endpoint gw.dronedocs.net --token <token>
+# admin side: mint a token against the RUNNING daemon (no passphrase, no restart)
+TOKEN=$(kubectl -n ghostwire exec deploy/ghostwire -c ghostwire -- \
+  ghostwire token create -c /etc/ghostwire --role operator --uses 1 --expires 1h)
+# client side (passphrase via env, no prompt):
+GHOSTWIRE_PASSPHRASE=... ghostwire join --endpoint gw.dronedocs.net --token "$TOKEN"
 ```
 
 For UDP gossip discovery, the client must be on WARP (so `10.42.0.0/16` routes).
