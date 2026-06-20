@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"runtime"
+	"strings"
 	"sync"
 
 	"golang.org/x/crypto/curve25519"
@@ -100,8 +102,16 @@ func New(cfg *Config) (*Device, error) {
 	// Create logger
 	logger := device.NewLogger(cfg.LogLevel, fmt.Sprintf("(%s) ", cfg.InterfaceName))
 
+	// macOS requires the TUN device be named "utun" or "utunN"; a Linux-style
+	// name like "gw0" is rejected. Pass "utun" so the kernel assigns the next
+	// free utun unit (the real name is read back from tunDev.Name() below).
+	ifName := cfg.InterfaceName
+	if runtime.GOOS == "darwin" && !strings.HasPrefix(ifName, "utun") {
+		ifName = "utun"
+	}
+
 	// Create TUN device
-	tunDev, err := tun.CreateTUN(cfg.InterfaceName, cfg.MTU)
+	tunDev, err := tun.CreateTUN(ifName, cfg.MTU)
 	if err != nil {
 		return nil, fmt.Errorf("create TUN device: %w", err)
 	}
