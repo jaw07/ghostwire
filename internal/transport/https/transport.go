@@ -379,9 +379,15 @@ func parseHTTPRequest(data []byte) (*http.Request, error) {
 	}
 	req.Method = string(parts[0])
 
-	// Parse URL
+	// Parse URL. A malformed request target (e.g. "%" or an invalid escape)
+	// makes url.Parse return an error and a nil URL; rejecting here prevents a
+	// nil-pointer deref of req.URL.Path downstream in knock validation, which
+	// an attacker could otherwise trigger to crash the daemon.
 	urlStr := string(parts[1])
-	parsedURL, _ := url.Parse(urlStr)
+	parsedURL, err := url.Parse(urlStr)
+	if err != nil || parsedURL == nil {
+		return nil, fmt.Errorf("invalid request target")
+	}
 	req.URL = parsedURL
 
 	// Parse headers

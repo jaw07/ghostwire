@@ -711,9 +711,14 @@ func startDaemon(configDir string, foreground bool) error {
 			// create` (and `kubectl exec`) can reach the daemon without the
 			// config passphrase.
 			apiInfo := fmt.Sprintf("http://%s\n%s\n", guiCfg.ListenAddr, guiServer.AuthToken())
-			if err := os.WriteFile(filepath.Join(configDir, "daemon-api"), []byte(apiInfo), 0600); err != nil {
+			daemonAPIPath := filepath.Join(configDir, "daemon-api")
+			if err := os.WriteFile(daemonAPIPath, []byte(apiInfo), 0600); err != nil {
 				fmt.Printf("Warning: could not write daemon-api file: %v\n", err)
 			}
+			// Don't leave the API token on disk after the daemon exits — the
+			// token is regenerated each run, so a stale file is both a dangling
+			// credential and a confusing source of auth failures.
+			defer os.Remove(daemonAPIPath)
 		}
 
 		go func() {

@@ -18,6 +18,12 @@ import (
 	"github.com/ghostwire/ghostwire/internal/transport/https"
 )
 
+// transportIdleTimeout bounds how long a post-knock transport connection may go
+// without any read before it is reaped. WireGuard persistent keepalive (25s)
+// keeps live tunnels well under this; it exists to free goroutines/connections
+// held by dead or stalled (slowloris) peers.
+const transportIdleTimeout = 5 * time.Minute
+
 // wsConn wraps a net.Conn with WebSocket binary framing.
 // This makes post-knock WireGuard traffic look like a WebSocket session
 // to DPI systems. Each WireGuard packet is sent as a WebSocket binary frame
@@ -511,9 +517,13 @@ func (b *HTTPSBind) receiveLoop(ep *httpsEndpoint) {
 	// Receive loop for connection
 	buf := make([]byte, 65536)
 	for {
+		// Idle read deadline: reap connections that go silent. WireGuard
+		// persistent keepalive (25s) keeps healthy tunnels well within this,
+		// so only dead/stalled peers (slowloris) trip it.
+		ep.conn.SetReadDeadline(time.Now().Add(transportIdleTimeout))
 		n, err := ep.conn.Read(buf)
 		if err != nil {
-			// Connection closed or error
+			// Connection closed, idle-timed-out, or error
 			b.connsMu.Lock()
 			delete(b.remoteConns, ep.addr)
 			b.connsMu.Unlock()
@@ -728,6 +738,15 @@ func (b *HTTPSBind) StartListener(addr string, tlsConfig *tls.Config) error {
 }
 
 func (b *HTTPSBind) handleIncoming(c net.Conn) {
+	// Defense in depth: a malformed knock from an untrusted peer must never
+	// take down the daemon. Recover from any panic in knock parsing/validation
+	// and just drop the connection.
+	defer func() {
+		if r := recover(); r != nil {
+			c.Close()
+		}
+	}()
+
 	// Read the full knock HTTP request using buffered reads.
 	// A single Read may not return the complete HTTP request on slow/fragmented connections.
 	c.SetReadDeadline(time.Now().Add(10 * time.Second))
