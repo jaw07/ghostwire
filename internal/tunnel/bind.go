@@ -15,6 +15,7 @@ import (
 
 	"golang.zx2c4.com/wireguard/conn"
 
+	"github.com/ghostwire/ghostwire/internal/obfuscation"
 	"github.com/ghostwire/ghostwire/internal/transport/https"
 )
 
@@ -217,8 +218,24 @@ type HTTPSBind struct {
 	recvChan    chan recvPacket
 	done        chan struct{}  // closed by Close() to signal receive loops to stop
 	listeners   []net.Listener // server-side listeners, closed by Close()
+	obfuscate   bool           // wrap post-knock conns with the padding-mimicry layer
 	closed      bool
 	closeMu     sync.Mutex
+}
+
+// maybeObfuscate wraps a post-knock connection with the padding-mimicry layer
+// when enabled (size-mimicry only — no timing jitter or decoy traffic, which
+// would harm a live tunnel). Both peers must have it enabled; the config flag
+// is mesh-wide.
+func (b *HTTPSBind) maybeObfuscate(c net.Conn) net.Conn {
+	if !b.obfuscate {
+		return c
+	}
+	return obfuscation.NewObfuscatedConn(c,
+		&obfuscation.PaddingConfig{Enabled: true, Mode: "mimic", TargetSizes: obfuscation.CommonHTTPSizes},
+		&obfuscation.JitterConfig{Enabled: false},
+		nil,
+	)
 }
 
 type recvPacket struct {
@@ -270,6 +287,10 @@ type BindConfig struct {
 	// ListenAddr for server mode (empty = client only)
 	ListenAddr string
 
+	// Obfuscate enables the padding-mimicry layer on post-knock connections.
+	// Must match across the mesh.
+	Obfuscate bool
+
 	// TLSConfig for custom TLS settings
 	TLSConfig *tls.Config
 }
@@ -294,6 +315,7 @@ func NewHTTPSBind(cfg *BindConfig) (*HTTPSBind, error) {
 		remoteConns: make(map[string]*httpsEndpoint),
 		recvChan:    make(chan recvPacket, 256),
 		done:        make(chan struct{}),
+		obfuscate:   cfg.Obfuscate,
 	}
 
 	return b, nil
@@ -493,7 +515,7 @@ func (b *HTTPSBind) dialRaw(ctx context.Context, addr string) (net.Conn, error) 
 		tlsConn.Close()
 		return nil, fmt.Errorf("websocket wrap: %w", err)
 	}
-	return ws, nil
+	return b.maybeObfuscate(ws), nil
 }
 
 // ParseEndpoint implements conn.Bind
@@ -793,7 +815,7 @@ func (b *HTTPSBind) handleIncoming(c net.Conn) {
 	remoteAddr := c.RemoteAddr().String()
 
 	ep := &httpsEndpoint{
-		conn: wsConn,
+		conn: b.maybeObfuscate(wsConn),
 		addr: remoteAddr,
 	}
 

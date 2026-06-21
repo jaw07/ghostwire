@@ -3,8 +3,10 @@
 package obfuscation
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/binary"
+	"fmt"
 	"io"
 	mrand "math/rand"
 	"net"
@@ -458,107 +460,198 @@ func (d *DecoyGenerator) sendDecoy() {
 	d.conn.Write(decoy)
 }
 
-// ObfuscatedConn wraps a connection with obfuscation features
+// Obfuscation frame format (length-prefixed, stream-safe):
+//
+//	[uint16 bodyLen][uint8 type][uint16 dataLen][data: dataLen][padding: rest]
+//
+// bodyLen counts everything after itself. type distinguishes real data from
+// decoy traffic. The length prefix lets the reader reassemble exactly one frame
+// regardless of how the underlying stream coalesces or splits writes — fixing
+// the previous datagram-only assumption. One Write produces one frame and one
+// peer Read returns that frame's data, preserving packet boundaries.
+const (
+	obfTypeDecoy  byte = 0
+	obfTypeData   byte = 1
+	obfHeaderLen       = 3     // type(1) + dataLen(2)
+	obfMaxBodyLen      = 65535 // uint16 prefix
+)
+
+// ObfuscatedConn wraps a connection with padding, timing jitter, and decoy
+// traffic. It is a correct net.Conn over any stream: writes are length-prefixed
+// frames, and data/decoy writes are serialized so they never interleave.
 type ObfuscatedConn struct {
 	net.Conn
 	padder   *Padder
 	jitterer *Jitterer
-	decoy    *DecoyGenerator
-	readBuf  []byte
+
+	br      *bufio.Reader
+	readBuf []byte // leftover decoded data when the caller's buffer was too small
+
+	writeMu sync.Mutex // serializes data + decoy frame writes
+
+	decoyCfg  *DecoyConfig
+	rng       *mrand.Rand
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // NewObfuscatedConn creates an obfuscated connection wrapper
 func NewObfuscatedConn(conn net.Conn, padCfg *PaddingConfig, jitCfg *JitterConfig, decoyCfg *DecoyConfig) *ObfuscatedConn {
+	seed := make([]byte, 8)
+	rand.Read(seed)
+
 	oc := &ObfuscatedConn{
 		Conn:     conn,
 		padder:   NewPadder(padCfg),
 		jitterer: NewJitterer(jitCfg),
+		br:       bufio.NewReader(conn),
+		decoyCfg: decoyCfg,
+		rng:      mrand.New(mrand.NewSource(int64(binary.BigEndian.Uint64(seed)))),
+		done:     make(chan struct{}),
 	}
 
 	if decoyCfg != nil && decoyCfg.Enabled {
-		oc.decoy = NewDecoyGenerator(decoyCfg, conn)
-		oc.decoy.Start()
+		go oc.decoyLoop()
 	}
 
 	return oc
 }
 
-// Read returns the next unpadded record.
-//
-// LIMITATION: the padded wire format ([dataLen:2][data][padding]) carries no
-// total-record-length prefix, so this method assumes each underlying Conn.Read
-// returns exactly one full padded record (datagram-like). Over a TCP stream
-// that coalesces/splits writes this assumption can desync. Before wiring
-// ObfuscatedConn into a stream transport, the format must gain a total-length
-// prefix and this loop must buffer/reassemble on it. (ObfuscatedConn currently
-// has no production callers.)
+// writeFrame builds and writes one length-prefixed frame, applying padding to
+// the configured target size. Writes are serialized so concurrent data and
+// decoy frames never interleave on the wire.
+func (oc *ObfuscatedConn) writeFrame(frameType byte, data []byte) error {
+	dataLen := len(data)
+	if dataLen > obfMaxBodyLen-obfHeaderLen {
+		return fmt.Errorf("obfuscation: frame too large: %d bytes", dataLen)
+	}
+
+	padding := 0
+	if oc.padder.cfg.Enabled {
+		oc.padder.mu.Lock()
+		target := oc.padder.selectTargetSize(dataLen)
+		oc.padder.mu.Unlock()
+		if p := target - (obfHeaderLen + dataLen); p > 0 {
+			padding = p
+		}
+	}
+	bodyLen := obfHeaderLen + dataLen + padding
+	if bodyLen > obfMaxBodyLen {
+		bodyLen = obfMaxBodyLen
+		padding = bodyLen - obfHeaderLen - dataLen
+	}
+
+	frame := make([]byte, 2+bodyLen)
+	binary.BigEndian.PutUint16(frame[0:2], uint16(bodyLen))
+	frame[2] = frameType
+	binary.BigEndian.PutUint16(frame[3:5], uint16(dataLen))
+	copy(frame[5:5+dataLen], data)
+	if padding > 0 {
+		rand.Read(frame[5+dataLen:])
+	}
+
+	oc.writeMu.Lock()
+	defer oc.writeMu.Unlock()
+	_, err := oc.Conn.Write(frame)
+	return err
+}
+
+// Read returns the data of the next non-decoy frame.
 func (oc *ObfuscatedConn) Read(b []byte) (int, error) {
-	// Return buffered data first
 	if len(oc.readBuf) > 0 {
 		n := copy(b, oc.readBuf)
 		oc.readBuf = oc.readBuf[n:]
 		return n, nil
 	}
 
-	buf := make([]byte, 65536)
 	for {
-		// Read from underlying connection
-		n, err := oc.Conn.Read(buf)
-		if err != nil {
+		var lh [2]byte
+		if _, err := io.ReadFull(oc.br, lh[:]); err != nil {
+			return 0, err
+		}
+		bodyLen := int(binary.BigEndian.Uint16(lh[:]))
+		if bodyLen < obfHeaderLen {
+			return 0, fmt.Errorf("obfuscation: short frame: %d", bodyLen)
+		}
+
+		body := make([]byte, bodyLen)
+		if _, err := io.ReadFull(oc.br, body); err != nil {
 			return 0, err
 		}
 
-		// Check for decoy (first byte = 0x00) — discard and loop
-		if n > 0 && buf[0] == 0x00 {
-			continue
+		frameType := body[0]
+		dataLen := int(binary.BigEndian.Uint16(body[1:3]))
+		if dataLen > bodyLen-obfHeaderLen {
+			return 0, fmt.Errorf("obfuscation: bad data length %d > %d", dataLen, bodyLen-obfHeaderLen)
+		}
+		if frameType == obfTypeDecoy {
+			continue // discard decoy traffic, read the next frame
 		}
 
-		// Unpad
-		data, err := oc.padder.Unpad(buf[:n])
-		if err != nil {
-			return 0, err
+		data := body[obfHeaderLen : obfHeaderLen+dataLen]
+		n := copy(b, data)
+		if n < len(data) {
+			oc.readBuf = append([]byte(nil), data[n:]...)
 		}
-
-		// Copy to output
-		copied := copy(b, data)
-		if copied < len(data) {
-			oc.readBuf = data[copied:]
-		}
-
-		return copied, nil
+		return n, nil
 	}
 }
 
 func (oc *ObfuscatedConn) Write(b []byte) (int, error) {
-	// Apply jitter
-	delay := oc.jitterer.Delay()
-	if delay > 0 {
+	if delay := oc.jitterer.Delay(); delay > 0 {
 		time.Sleep(delay)
 	}
-
-	// Mark as real data (first byte != 0x00)
-	if len(b) > 0 && b[0] == 0x00 {
-		// Escape the 0x00 by prepending 0x01
-		b = append([]byte{0x01}, b...)
-	}
-
-	// Pad
-	padded := oc.padder.Pad(b)
-
-	// Write
-	_, err := oc.Conn.Write(padded)
-	if err != nil {
+	if err := oc.writeFrame(obfTypeData, b); err != nil {
 		return 0, err
 	}
-
 	return len(b), nil
 }
 
 func (oc *ObfuscatedConn) Close() error {
-	if oc.decoy != nil {
-		oc.decoy.Stop()
-	}
+	oc.closeOnce.Do(func() { close(oc.done) })
 	return oc.Conn.Close()
+}
+
+// decoyLoop periodically emits decoy frames (indistinguishable on the wire from
+// data frames after padding) until the connection is closed.
+func (oc *ObfuscatedConn) decoyLoop() {
+	for {
+		select {
+		case <-oc.done:
+			return
+		case <-time.After(oc.decoyInterval()):
+		}
+
+		size := oc.decoySize()
+		payload := make([]byte, size)
+		rand.Read(payload)
+		if err := oc.writeFrame(obfTypeDecoy, payload); err != nil {
+			return
+		}
+	}
+}
+
+func (oc *ObfuscatedConn) decoyInterval() time.Duration {
+	minNs := oc.decoyCfg.MinInterval.Nanoseconds()
+	maxNs := oc.decoyCfg.MaxInterval.Nanoseconds()
+	if span := maxNs - minNs; span > 0 {
+		return time.Duration(minNs + oc.rng.Int63n(span))
+	}
+	if minNs <= 0 {
+		return time.Second // avoid a hot loop on zero config
+	}
+	return time.Duration(minNs)
+}
+
+func (oc *ObfuscatedConn) decoySize() int {
+	size := oc.decoyCfg.MinSize
+	if span := oc.decoyCfg.MaxSize - oc.decoyCfg.MinSize; span > 0 {
+		size += oc.rng.Intn(span)
+	}
+	if size < 0 {
+		size = 0
+	}
+	return size
 }
 
 // ShapeTraffic applies traffic shaping to match a target pattern

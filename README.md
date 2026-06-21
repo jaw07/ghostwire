@@ -653,8 +653,11 @@ Relevant config fields / env vars:
 | Setting | Purpose |
 |---------|---------|
 | `transport.https.advertise_endpoint` | host:port enrolling nodes dial for the transport (`init --advertise`) |
+| `transport.https.obfuscate` | extra padding-mimicry layer on the transport (pads frames to common HTTPS sizes). Off by default; **must match on all nodes** |
 | `GHOSTWIRE_PASSPHRASE` / `GHOSTWIRE_PASSPHRASE_FILE` | non-interactive config passphrase |
 | `GHOSTWIRE_POLICY_ENFORCE=1` | drop policy-denied packets (default: observe-only) |
+
+When `obfuscate` is set, post-knock connections are wrapped with a length-prefixed, padded frame layer (`internal/obfuscation`). Only size-mimicry is applied on the tunnel — timing jitter and decoy traffic (also in that package) are deliberately left off here, since they add latency and waste bandwidth on a live VPN. The flag changes the on-wire framing, so every peer must agree on it.
 
 Secure delete: random overwrite, zero overwrite, rename to random filename, unlink. Not effective on CoW filesystems (APFS, Btrfs).
 
