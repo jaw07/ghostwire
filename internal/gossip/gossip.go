@@ -93,8 +93,8 @@ type Gossip struct {
 	wg       sync.WaitGroup
 
 	// Pending probe acks
-	ackCh   map[uint64]chan *Message
-	ackMu   sync.Mutex
+	ackCh map[uint64]chan *Message
+	ackMu sync.Mutex
 
 	// Broadcast queue for disseminating updates
 	broadcasts   []broadcastItem
@@ -109,8 +109,8 @@ type Gossip struct {
 	seenMsgsMu sync.Mutex
 
 	// Custom message handler
-	onCustomMessage    func(msgType MessageType, from string, payload []byte)
-	onCustomMessageMu  sync.RWMutex
+	onCustomMessage   func(msgType MessageType, from string, payload []byte)
+	onCustomMessageMu sync.RWMutex
 }
 
 type broadcastItem struct {
@@ -644,7 +644,9 @@ func (g *Gossip) confirmDead(nodeID string) {
 	delete(g.suspicion, nodeID)
 	g.suspicionMu.Unlock()
 
-	if g.members.MarkDead(nodeID) {
+	// Only confirm death if still suspect — a node that refuted to Alive during
+	// the suspicion window (higher incarnation via gossip) must not be killed.
+	if g.members.MarkDeadIfSuspect(nodeID) {
 		// Broadcast death
 		dead := g.members.Get(nodeID)
 		if dead != nil {
@@ -741,9 +743,32 @@ func (g *Gossip) hmacMessage(msg *Message) []byte {
 	mac.Write([]byte(msg.Target))
 	mac.Write(msg.Digest)
 	for _, m := range msg.Members {
+		// Authenticate ALL routing-relevant fields, not just identity/state.
+		// Previously Endpoints/PublicKey/MeshIP were unprotected, so an on-path
+		// attacker could rewrite a peer's WireGuard pubkey or endpoint in a
+		// validly-signed gossip message and have it accepted (peer/route
+		// poisoning). NUL separators disambiguate the concatenation (these
+		// fields never contain NUL).
 		mac.Write([]byte(m.NodeID))
+		mac.Write([]byte{0})
 		mac.Write([]byte{byte(m.State)})
 		binary.Write(mac, binary.BigEndian, m.Incarnation)
+		mac.Write([]byte(m.PublicKey))
+		mac.Write([]byte{0})
+		mac.Write([]byte(m.MeshIP.String()))
+		mac.Write([]byte{0})
+		mac.Write([]byte(m.Transport))
+		mac.Write([]byte{0})
+		for _, ep := range m.Endpoints {
+			mac.Write([]byte(ep))
+			mac.Write([]byte{0})
+		}
+		mac.Write([]byte{1}) // section separator
+		for _, r := range m.Roles {
+			mac.Write([]byte(r))
+			mac.Write([]byte{0})
+		}
+		mac.Write([]byte{2}) // member terminator
 	}
 	mac.Write(msg.Payload)
 	return mac.Sum(nil)[:16]
