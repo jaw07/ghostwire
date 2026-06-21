@@ -177,7 +177,7 @@ Admin                                            New Node
   |     Allocate mesh IP                           |
   |     Issue X.509 certificate                    |
   |                                                |
-  |--- {cert, ca_cert, peers, ------------------->| 4. Mesh config response
+  |--- {cert, ca_cert, peers, -------------------->| 4. Mesh config response
   |     mesh_secret, transport}                    |
   |                                                |
   |                                                | 5. Node verifies:
