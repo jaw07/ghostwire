@@ -870,9 +870,9 @@ func buildSTUNResponse(ip [4]byte, port uint16) []byte {
 	magicCookie := [4]byte{0x21, 0x12, 0xa4, 0x42}
 
 	header := make([]byte, 20)
-	binary.BigEndian.PutUint16(header[0:2], 0x0101)      // message type
-	binary.BigEndian.PutUint16(header[2:4], 12)           // message length (attrs only)
-	copy(header[4:8], magicCookie[:])                     // magic cookie
+	binary.BigEndian.PutUint16(header[0:2], 0x0101) // message type
+	binary.BigEndian.PutUint16(header[2:4], 12)     // message length (attrs only)
+	copy(header[4:8], magicCookie[:])               // magic cookie
 	// transaction ID is zeros (bytes 8-19)
 
 	// XOR-MAPPED-ADDRESS attribute

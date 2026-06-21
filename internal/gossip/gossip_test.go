@@ -435,7 +435,7 @@ func TestMemberClone_DeepCopy(t *testing.T) {
 		MeshIP:      netip.MustParseAddr("10.0.0.1"),
 		Endpoints:   []string{"1.2.3.4:7946"},
 		Roles:       []string{"relay"},
-		PublicKey:    "pk1",
+		PublicKey:   "pk1",
 		State:       StateAlive,
 		Incarnation: 5,
 		Metadata:    map[string]string{"key": "val"},

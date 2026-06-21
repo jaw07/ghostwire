@@ -172,7 +172,7 @@ type udpListener struct {
 	mu      sync.Mutex
 	closed  bool
 	clients map[string]*udpVirtualConn // remoteAddr string -> vconn
-	acceptQ chan *udpVirtualConn        // new connections for Accept()
+	acceptQ chan *udpVirtualConn       // new connections for Accept()
 	done    chan struct{}
 }
 

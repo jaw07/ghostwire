@@ -287,8 +287,8 @@ func (fd *FrontedDialer) Dial(ctx context.Context) (net.Conn, error) {
 func WellKnownFronts() map[string]string {
 	return map[string]string{
 		// Note: These are examples - actual availability varies
-		"www.google.com":     "www.google.com:443",
-		"ajax.googleapis.com": "ajax.googleapis.com:443",
+		"www.google.com":       "www.google.com:443",
+		"ajax.googleapis.com":  "ajax.googleapis.com:443",
 		"fonts.googleapis.com": "fonts.googleapis.com:443",
 	}
 }

@@ -214,18 +214,18 @@ func TestEvaluate_PriorityOrdering(t *testing.T) {
 		Name:    "priority",
 		Rules: []*Rule{
 			{
-				Name:     "low-allow",
-				Priority: 1,
-				Subjects: SubjectSpec{Roles: []string{"*"}},
+				Name:      "low-allow",
+				Priority:  1,
+				Subjects:  SubjectSpec{Roles: []string{"*"}},
 				Resources: ResourceSpec{Nodes: []string{"*"}},
-				Effect:   EffectAllow,
+				Effect:    EffectAllow,
 			},
 			{
-				Name:     "high-deny",
-				Priority: 100,
-				Subjects: SubjectSpec{Roles: []string{"*"}},
+				Name:      "high-deny",
+				Priority:  100,
+				Subjects:  SubjectSpec{Roles: []string{"*"}},
 				Resources: ResourceSpec{Nodes: []string{"*"}},
-				Effect:   EffectDeny,
+				Effect:    EffectDeny,
 			},
 		},
 	})
@@ -435,10 +435,10 @@ func TestEvaluate_NetworkMatching(t *testing.T) {
 
 func TestPortRange_Contains(t *testing.T) {
 	tests := []struct {
-		name  string
-		pr    PortRange
-		port  uint16
-		want  bool
+		name string
+		pr   PortRange
+		port uint16
+		want bool
 	}{
 		{"single port match", PortRange{Start: 443}, 443, true},
 		{"single port no match", PortRange{Start: 443}, 80, false},
@@ -903,11 +903,11 @@ func TestStats_And_ResetStats(t *testing.T) {
 		Name:    "stats-test",
 		Rules: []*Rule{
 			{
-				Name:     "allow-all",
-				Priority: 10,
-				Subjects: SubjectSpec{Roles: []string{"*"}},
+				Name:      "allow-all",
+				Priority:  10,
+				Subjects:  SubjectSpec{Roles: []string{"*"}},
 				Resources: ResourceSpec{Nodes: []string{"*"}},
-				Effect:   EffectAllow,
+				Effect:    EffectAllow,
 			},
 		},
 	})

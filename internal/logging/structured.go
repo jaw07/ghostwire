@@ -54,14 +54,14 @@ func ParseLevel(s string) (Level, error) {
 
 // Entry is a single log entry
 type Entry struct {
-	Timestamp time.Time         `json:"ts"`
-	Level     Level             `json:"level"`
-	Component string            `json:"component"`
-	NodeID    string            `json:"node_id,omitempty"`
-	Message   string            `json:"msg"`
-	Fields    map[string]any    `json:"fields,omitempty"`
-	Sensitive *SensitiveFields  `json:"-"` // Never serialized directly
-	Encrypted []byte            `json:"encrypted,omitempty"`
+	Timestamp time.Time        `json:"ts"`
+	Level     Level            `json:"level"`
+	Component string           `json:"component"`
+	NodeID    string           `json:"node_id,omitempty"`
+	Message   string           `json:"msg"`
+	Fields    map[string]any   `json:"fields,omitempty"`
+	Sensitive *SensitiveFields `json:"-"` // Never serialized directly
+	Encrypted []byte           `json:"encrypted,omitempty"`
 }
 
 // SensitiveFields contains data that must be encrypted
