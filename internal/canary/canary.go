@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"sync"
@@ -154,11 +155,18 @@ func (c *Canary) IsDue() bool {
 	return time.Since(c.LastCheckIn) > c.CheckInInterval
 }
 
-// RecordMiss increments the missed count and returns true if threshold exceeded
+// RecordMiss recomputes the missed count and returns true if the threshold is
+// reached. Misses are derived from elapsed time / CheckInInterval rather than
+// incremented per call, so Threshold means "N missed check-in windows"
+// regardless of how often the monitor polls (incrementing per poll tripped the
+// switch after Threshold ticks instead of Threshold intervals).
 func (c *Canary) RecordMiss() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.MissedCount++
+	if c.CheckInInterval <= 0 {
+		return false
+	}
+	c.MissedCount = int(time.Since(c.LastCheckIn) / c.CheckInInterval)
 	return c.MissedCount >= c.Threshold
 }
 
@@ -209,14 +217,23 @@ func Verify(sc *SignedCanary, publicKey ed25519.PublicKey) bool {
 
 // signatureData returns the data to sign
 func (c *Canary) signatureData() []byte {
-	// Include all immutable fields
+	// Include all immutable fields. The variable-length strings are
+	// length-prefixed so adjacent fields can't be shifted across the boundary
+	// to forge a different canary with the same signing input.
 	data := make([]byte, 0, 128)
 	data = append(data, c.ID[:]...)
 	data = append(data, byte(c.Type))
-	data = append(data, []byte(c.NodeID)...)
-	data = append(data, []byte(c.Description)...)
-	data = append(data, []byte(c.Context)...)
+	data = appendLenPrefixed(data, []byte(c.NodeID))
+	data = appendLenPrefixed(data, []byte(c.Description))
+	data = appendLenPrefixed(data, []byte(c.Context))
 	return data
+}
+
+func appendLenPrefixed(dst, field []byte) []byte {
+	var l [4]byte
+	binary.BigEndian.PutUint32(l[:], uint32(len(field)))
+	dst = append(dst, l[:]...)
+	return append(dst, field...)
 }
 
 // Alert contains information about a triggered canary
@@ -247,6 +264,14 @@ type AlertDetails struct {
 
 // NewAlert creates an alert from a triggered canary
 func NewAlert(c *Canary) *Alert {
+	// Snapshot the mutable fields under the lock (they race with
+	// CheckIn/RecordMiss/Trigger). IDString locks internally, so read it
+	// outside the critical section to avoid re-entrant locking.
+	c.mu.Lock()
+	missedCount := c.MissedCount
+	lastCheckIn := c.LastCheckIn
+	c.mu.Unlock()
+
 	alert := &Alert{
 		CanaryID:    c.IDString(),
 		CanaryType:  c.Type,
@@ -257,8 +282,8 @@ func NewAlert(c *Canary) *Alert {
 
 	switch c.Type {
 	case TypeDeadSwitch:
-		alert.Details.MissedCount = c.MissedCount
-		alert.Details.LastCheckIn = c.LastCheckIn
+		alert.Details.MissedCount = missedCount
+		alert.Details.LastCheckIn = lastCheckIn
 	case TypeTripwire:
 		alert.Details.AccessPath = c.Context
 		alert.Details.AccessTime = time.Now()

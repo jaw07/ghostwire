@@ -26,7 +26,8 @@ const (
 // Verifier validates attestation claims
 type Verifier struct {
 	mu            sync.RWMutex
-	trustedHashes map[string]string // binary hash -> version string
+	trustedHashes map[string]string      // binary hash -> version string
+	consumed      map[[16]byte]time.Time // nonces already used (replay defense)
 	maxClockSkew  time.Duration
 	maxAge        time.Duration
 	requireConfig bool // Require config hash
@@ -43,6 +44,7 @@ type VerifierConfig struct {
 func NewVerifier(cfg *VerifierConfig) *Verifier {
 	v := &Verifier{
 		trustedHashes: make(map[string]string),
+		consumed:      make(map[[16]byte]time.Time),
 		maxClockSkew:  DefaultMaxClockSkew,
 		maxAge:        DefaultMaxAge,
 	}
@@ -119,6 +121,23 @@ func (v *Verifier) Verify(claim *Claim, publicKey ed25519.PublicKey, expectedNon
 		result.AddIssue("nonce mismatch")
 		return result
 	}
+
+	// 2b. Replay defense: a (signed, matching) nonce may be accepted only once.
+	// Without this, a captured valid claim replays freely within maxAge.
+	v.mu.Lock()
+	now2 := time.Now()
+	for n, used := range v.consumed {
+		if now2.Sub(used) > v.maxAge {
+			delete(v.consumed, n)
+		}
+	}
+	if _, used := v.consumed[claim.Nonce]; used {
+		v.mu.Unlock()
+		result.AddIssue("nonce already used (replay)")
+		return result
+	}
+	v.consumed[claim.Nonce] = now2
+	v.mu.Unlock()
 
 	// 3. Verify timestamp is fresh
 	now := time.Now().UTC()

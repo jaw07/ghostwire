@@ -4,9 +4,11 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/asn1"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"time"
 )
@@ -43,25 +45,25 @@ func (t Type) String() string {
 
 // Claim represents a node's attestation
 type Claim struct {
-	Type        Type
-	NodeID      string
-	Timestamp   time.Time
-	BinaryHash  [32]byte
-	ConfigHash  [32]byte
-	SystemInfo  SystemInfo
-	Nonce       [16]byte // Challenge nonce for freshness
-	TPMQuote    []byte   // Optional TPM quote
-	Signature   []byte   // Signed by node key
+	Type       Type
+	NodeID     string
+	Timestamp  time.Time
+	BinaryHash [32]byte
+	ConfigHash [32]byte
+	SystemInfo SystemInfo
+	Nonce      [16]byte // Challenge nonce for freshness
+	TPMQuote   []byte   // Optional TPM quote
+	Signature  []byte   // Signed by node key
 }
 
 // SystemInfo captures system characteristics
 type SystemInfo struct {
-	OS            string
-	Arch          string
-	GoVersion     string
-	NumCPU        int
-	Hostname      string
-	BootID        string // Unique per boot on Linux
+	OS        string
+	Arch      string
+	GoVersion string
+	NumCPU    int
+	Hostname  string
+	BootID    string // Unique per boot on Linux
 }
 
 // GatherSystemInfo collects current system information
@@ -84,7 +86,7 @@ func getBootID() string {
 	// Linux: /proc/sys/kernel/random/boot_id
 	if runtime.GOOS == "linux" {
 		data, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
-		if err == nil {
+		if err == nil && len(data) >= 36 {
 			return string(data[:36]) // UUID format
 		}
 	}
@@ -138,6 +140,11 @@ func (c *Claim) Verify(publicKey ed25519.PublicKey) bool {
 func (c *Claim) signatureData() []byte {
 	data := make([]byte, 0, 256)
 	data = append(data, byte(c.Type))
+	// Length-prefix the variable-length NodeID so it can't shift the boundary
+	// with the following fixed-size fields (signing-input ambiguity).
+	var nl [2]byte
+	binary.BigEndian.PutUint16(nl[:], uint16(len(c.NodeID)))
+	data = append(data, nl[:]...)
 	data = append(data, []byte(c.NodeID)...)
 	data = append(data, c.BinaryHash[:]...)
 	data = append(data, c.ConfigHash[:]...)
@@ -184,16 +191,11 @@ func ComputeBinaryHash() ([32]byte, error) {
 	return hash, nil
 }
 
-// evalSymlinks resolves symbolic links in a path
+// evalSymlinks fully resolves symbolic links in a path (multi-hop, relative
+// links included) so the hashed binary is the real target, not an intermediate
+// or relative link.
 func evalSymlinks(path string) (string, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return path, err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return os.Readlink(path)
-	}
-	return path, nil
+	return filepath.EvalSymlinks(path)
 }
 
 // ComputeConfigHash computes a hash of config data (should exclude secrets)
