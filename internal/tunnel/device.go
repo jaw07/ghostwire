@@ -228,6 +228,7 @@ func NewFromConfig(meshCfg *config.MeshConfig, privateKey [32]byte, meshSecret [
 			MeshSecret:     meshSecret,
 			ListenAddr:     meshCfg.Transport.HTTPS.ListenAddr,
 			LocalPublicKey: localPubKey[:],
+			Obfuscate:      meshCfg.Transport.HTTPS.Obfuscate,
 		}
 	case "hybrid":
 		cfg.TransportMode = "hybrid"
@@ -236,6 +237,7 @@ func NewFromConfig(meshCfg *config.MeshConfig, privateKey [32]byte, meshSecret [
 			MeshSecret:     meshSecret,
 			ListenAddr:     meshCfg.Transport.HTTPS.ListenAddr,
 			LocalPublicKey: localPubKey[:],
+			Obfuscate:      meshCfg.Transport.HTTPS.Obfuscate,
 		}
 	case "direct", "":
 		cfg.TransportMode = "direct"

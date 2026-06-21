@@ -95,6 +95,14 @@ type HTTPSTransportConfig struct {
 	// behind a Cloudflare tunnel ("gwt.example.com:443") or a NAT. When empty,
 	// peers fall back to the admin host + transport port.
 	AdvertiseEndpoint string `yaml:"advertise_endpoint,omitempty"`
+
+	// Obfuscate enables an additional padding-mimicry layer on the transport
+	// (frames are padded to common HTTPS sizes). It is OFF by default and must
+	// be set identically on ALL nodes in the mesh — a mismatch breaks the
+	// tunnel framing between peers. Only size-mimicry is applied; timing jitter
+	// and decoy traffic are intentionally not used here, as they add latency
+	// and waste bandwidth on a live tunnel.
+	Obfuscate bool `yaml:"obfuscate,omitempty"`
 }
 
 // QUICTransportConfig configures the QUIC transport

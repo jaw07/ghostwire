@@ -453,110 +453,125 @@ func TestObfuscatedConnWriteReadRoundTrip(t *testing.T) {
 	}
 }
 
-func TestObfuscatedConnWriteEscapesZeroByte(t *testing.T) {
-	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
+// tcpPair returns two ends of a connected TCP loopback connection, so tests
+// exercise real stream coalescing/splitting (net.Pipe is synchronous and would
+// hide framing bugs).
+func tcpPair(t *testing.T) (net.Conn, net.Conn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
 
-	jitCfg := &JitterConfig{Enabled: false}
-	padCfg := &PaddingConfig{Enabled: false}
-	writer := NewObfuscatedConn(c1, padCfg, jitCfg, nil)
-	reader := NewObfuscatedConn(c2, padCfg, jitCfg, nil)
-
-	// Data starting with 0x00 should be escaped with 0x01 prefix
-	original := []byte{0x00, 0xAA, 0xBB}
-
-	done := make(chan error, 1)
+	type res struct {
+		c   net.Conn
+		err error
+	}
+	ch := make(chan res, 1)
 	go func() {
-		_, err := writer.Write(original)
-		done <- err
+		c, err := ln.Accept()
+		ch <- res{c, err}
 	}()
 
-	buf := make([]byte, 1024)
-	n, err := reader.Read(buf)
+	cli, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
-		t.Fatalf("Read error: %v", err)
+		t.Fatal(err)
+	}
+	r := <-ch
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	return r.c, cli
+}
+
+func TestObfuscatedConnRoundTrip(t *testing.T) {
+	srv, cli := tcpPair(t)
+	defer srv.Close()
+	defer cli.Close()
+
+	padCfg := &PaddingConfig{Enabled: true, Mode: "mimic", TargetSizes: CommonHTTPSizes}
+	jitCfg := &JitterConfig{Enabled: false}
+	writer := NewObfuscatedConn(cli, padCfg, jitCfg, nil)
+	reader := NewObfuscatedConn(srv, padCfg, jitCfg, nil)
+	defer writer.Close()
+	defer reader.Close()
+
+	big := make([]byte, 1400)
+	for i := range big {
+		big[i] = byte(i)
+	}
+	packets := [][]byte{
+		[]byte("hello"),
+		{0x00}, // a packet starting with 0x00 (the old escape edge case)
+		big,
+		[]byte("final packet"),
 	}
 
-	if werr := <-done; werr != nil {
-		t.Fatalf("Write error: %v", werr)
-	}
+	go func() {
+		for _, p := range packets {
+			if _, err := writer.Write(p); err != nil {
+				return
+			}
+		}
+	}()
 
-	// With padding disabled, the writer prepends 0x01 and sends as-is.
-	// The reader's Unpad returns data as-is for short inputs (no valid header).
-	// So we get the escaped form: [0x01, 0x00, 0xAA, 0xBB].
-	got := buf[:n]
-	expected := []byte{0x01, 0x00, 0xAA, 0xBB}
-	if !bytes.Equal(got, expected) {
-		t.Fatalf("escaped data mismatch: got %x, want %x", got, expected)
+	for i, want := range packets {
+		// Small-ish buffer to also exercise the readBuf leftover path.
+		buf := make([]byte, 4096)
+		n, err := reader.Read(buf)
+		if err != nil {
+			t.Fatalf("read packet %d: %v", i, err)
+		}
+		if !bytes.Equal(buf[:n], want) {
+			t.Errorf("packet %d: got %d bytes (%x...), want %d bytes", i, n, buf[:min(n, 8)], len(want))
+		}
 	}
 }
 
-func TestObfuscatedConnReadDiscardsDecoy(t *testing.T) {
-	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
-
-	// Disable padding so we can control the raw bytes on the wire.
-	jitCfg := &JitterConfig{Enabled: false}
-	padCfg := &PaddingConfig{Enabled: false}
-	reader := NewObfuscatedConn(c1, padCfg, jitCfg, nil)
-
-	// Write a decoy packet directly to the pipe, then a real packet.
-	go func() {
-		// Decoy: first byte 0x00 -- reader should skip this
-		decoy := []byte{0x00, 0xFF, 0xFF, 0xFF}
-		c2.Write(decoy)
-
-		// Real packet: first byte != 0x00 (padding disabled, no header)
-		realData := []byte("real packet")
-		c2.Write(realData)
-	}()
-
-	buf := make([]byte, 1024)
-	n, err := reader.Read(buf)
-	if err != nil {
-		t.Fatalf("Read error: %v", err)
-	}
-
-	// With padding disabled, Unpad returns short data as-is.
-	got := buf[:n]
-	if !bytes.Equal(got, []byte("real packet")) {
-		t.Fatalf("expected 'real packet', got %q", got)
-	}
-}
-
-func TestObfuscatedConnClose(t *testing.T) {
-	c1, c2 := net.Pipe()
-	defer c2.Close()
+func TestObfuscatedConnDiscardsDecoy(t *testing.T) {
+	srv, cli := tcpPair(t)
+	defer srv.Close()
+	defer cli.Close()
 
 	decoyCfg := &DecoyConfig{
 		Enabled:     true,
-		MinInterval: 50 * time.Millisecond,
-		MaxInterval: 100 * time.Millisecond,
-		MinSize:     64,
-		MaxSize:     128,
-		Pattern:     "random",
+		MinInterval: time.Millisecond,
+		MaxInterval: 2 * time.Millisecond,
+		MinSize:     32,
+		MaxSize:     64,
 	}
-	jitCfg := &JitterConfig{Enabled: false}
-	oc := NewObfuscatedConn(c1, nil, jitCfg, decoyCfg)
+	writer := NewObfuscatedConn(cli, &PaddingConfig{Enabled: false}, &JitterConfig{Enabled: false}, decoyCfg)
+	reader := NewObfuscatedConn(srv, &PaddingConfig{Enabled: false}, &JitterConfig{Enabled: false}, nil)
+	defer writer.Close()
+	defer reader.Close()
 
-	if oc.decoy == nil {
-		t.Fatal("expected decoy generator to be created")
-	}
+	// Let decoy frames flow, then send a real packet interleaved with them.
+	time.Sleep(20 * time.Millisecond)
+	go func() { writer.Write([]byte("REAL DATA")) }()
 
-	err := oc.Close()
+	buf := make([]byte, 1024)
+	n, err := reader.Read(buf)
 	if err != nil {
-		t.Fatalf("Close error: %v", err)
+		t.Fatalf("read: %v", err)
 	}
+	if string(buf[:n]) != "REAL DATA" {
+		t.Errorf("got %q, want REAL DATA (decoys must be discarded)", buf[:n])
+	}
+}
 
-	// After close, decoy should be stopped
-	oc.decoy.mu.Lock()
-	running := oc.decoy.running
-	oc.decoy.mu.Unlock()
-	if running {
-		t.Error("decoy generator still running after Close")
+func TestObfuscatedConnCloseIdempotent(t *testing.T) {
+	srv, cli := tcpPair(t)
+	defer srv.Close()
+
+	oc := NewObfuscatedConn(cli, nil, &JitterConfig{Enabled: false}, &DecoyConfig{
+		Enabled: true, MinInterval: time.Millisecond, MaxInterval: 2 * time.Millisecond, MinSize: 16, MaxSize: 32,
+	})
+	if err := oc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
+	// Second close must not panic (closeOnce guards the done channel).
+	_ = oc.Close()
 }
 
 // ---------------------------------------------------------------------------
