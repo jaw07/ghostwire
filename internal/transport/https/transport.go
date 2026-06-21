@@ -1,6 +1,7 @@
 package https
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -171,9 +172,10 @@ func (t *Transport) performKnock(conn net.Conn, knock *KnockSequence) error {
 		return err
 	}
 
-	// Check for success response
+	// Check for success response. Accept both 200 OK (legacy) and 101
+	// Switching Protocols (WebSocket upgrade), matching the server side.
 	response := string(buf[:n])
-	if len(response) < 12 || response[9:12] != "200" {
+	if len(response) < 12 || (response[9:12] != "200" && response[9:12] != "101") {
 		return ErrKnockFailed
 	}
 
@@ -286,22 +288,30 @@ func (l *httpsListener) acceptLoop() {
 }
 
 func (l *httpsListener) handleConnection(conn net.Conn) {
-	// Read initial request to check for knock. Bound the read with a deadline
-	// so an idle/slowloris client cannot pin a goroutine + connection forever.
-	buf := make([]byte, 4096)
+	// Read the full knock request with a deadline (slowloris protection). A
+	// single Read may not return the whole request when it is split across TLS
+	// records/TCP segments, so read until the header terminator (bounded).
 	conn.SetReadDeadline(time.Now().Add(knockReadTimeout))
-	n, err := conn.Read(buf)
-	if err != nil {
-		conn.Close()
-		return
+	var buf []byte
+	tmp := make([]byte, 4096)
+	for {
+		n, err := conn.Read(tmp)
+		if err != nil {
+			conn.Close()
+			return
+		}
+		buf = append(buf, tmp[:n]...)
+		if bytes.Contains(buf, []byte("\r\n\r\n")) || len(buf) > 8192 {
+			break
+		}
 	}
 	conn.SetReadDeadline(time.Time{}) // clear deadline for the tunnel lifetime
 
 	// Parse as HTTP request (simplified)
-	req, err := parseHTTPRequest(buf[:n])
+	req, err := parseHTTPRequest(buf)
 	if err != nil {
 		// Not a valid HTTP request - serve cover site or close
-		l.serveCover(conn, buf[:n])
+		l.serveCover(conn, buf)
 		return
 	}
 
@@ -379,9 +389,15 @@ func parseHTTPRequest(data []byte) (*http.Request, error) {
 	}
 	req.Method = string(parts[0])
 
-	// Parse URL
+	// Parse URL. A malformed request target (e.g. "%" or an invalid escape)
+	// makes url.Parse return an error and a nil URL; rejecting here prevents a
+	// nil-pointer deref of req.URL.Path downstream in knock validation, which
+	// an attacker could otherwise trigger to crash the daemon.
 	urlStr := string(parts[1])
-	parsedURL, _ := url.Parse(urlStr)
+	parsedURL, err := url.Parse(urlStr)
+	if err != nil || parsedURL == nil {
+		return nil, fmt.Errorf("invalid request target")
+	}
 	req.URL = parsedURL
 
 	// Parse headers

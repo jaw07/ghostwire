@@ -148,6 +148,11 @@ func (kv *KnockValidator) RemoveKnownClient(pubKey []byte) {
 // Validate checks if a request contains a valid knock sequence
 // Returns the client public key if valid, nil otherwise
 func (kv *KnockValidator) Validate(req *http.Request) []byte {
+	// Defensive: never dereference a nil URL (a malformed request can produce
+	// one); the request parser should already reject these.
+	if req == nil || req.URL == nil {
+		return nil
+	}
 	// Extract knock components from request
 	pathKnock := extractPathKnock(req.URL.Path)
 	if pathKnock == nil {

@@ -3,6 +3,7 @@ package gui
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"embed"
 	"encoding/hex"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -178,18 +180,23 @@ func (s *Server) AuthToken() string {
 	return s.authToken
 }
 
+// tokenMatches compares a presented token against the server's auth token in
+// constant time, to avoid leaking it via timing.
+func (s *Server) tokenMatches(presented string) bool {
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(s.authToken)) == 1
+}
+
 // authMiddleware checks the auth token
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check Authorization header
-		auth := r.Header.Get("Authorization")
-		if auth == "Bearer "+s.authToken {
+		// Check Authorization header (Bearer <token>)
+		if bearer, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok && s.tokenMatches(bearer) {
 			next.ServeHTTP(w, r)
 			return
 		}
 
 		// Check query parameter
-		if r.URL.Query().Get("token") == s.authToken {
+		if s.tokenMatches(r.URL.Query().Get("token")) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -200,8 +207,8 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 
 // handleWebSocket handles WebSocket connections
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// Check auth via query param
-	if r.URL.Query().Get("token") != s.authToken {
+	// Check auth via query param (constant-time)
+	if !s.tokenMatches(r.URL.Query().Get("token")) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}

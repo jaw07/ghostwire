@@ -3,6 +3,7 @@ package pqc
 import (
 	"crypto/rand"
 	"crypto/sha512"
+	"encoding/binary"
 	"fmt"
 	"io"
 
@@ -14,6 +15,17 @@ import (
 // kdfLabel domain-separates the hybrid KEM output derivation.
 const kdfLabel = "ghostwire-pqc-hybrid-v1"
 
+// appendField appends a 2-byte big-endian length prefix followed by the field.
+// Length-prefixing makes the transcript encoding injective so that two distinct
+// sets of fields can never serialize to the same byte string (independent of
+// the per-field length validation done by callers).
+func appendField(dst, field []byte) []byte {
+	var l [2]byte
+	binary.BigEndian.PutUint16(l[:], uint16(len(field)))
+	dst = append(dst, l[:]...)
+	return append(dst, field...)
+}
+
 // deriveCombined binds the combined shared secret to the full handshake
 // transcript so that an active attacker cannot substitute KEM material
 // without changing the derived key. The transcript covers the scheme tag,
@@ -24,13 +36,15 @@ func deriveCombined(scheme Scheme, ephemeral [X25519KeySize]byte, ciphertext []b
 	recipientX25519 [X25519KeySize]byte, recipientKyber []byte,
 	x25519SS [X25519KeySize]byte, kyberSS [KyberSharedSecretSize]byte) ([SharedSecretSize]byte, error) {
 
-	transcript := make([]byte, 0, len(kdfLabel)+1+X25519KeySize+len(ciphertext)+X25519KeySize+len(recipientKyber))
+	// label and scheme are a fixed-size prefix; the remaining (variable-length)
+	// fields are length-prefixed so the transcript is canonical.
+	transcript := make([]byte, 0, len(kdfLabel)+1+2*4+X25519KeySize+len(ciphertext)+X25519KeySize+len(recipientKyber))
 	transcript = append(transcript, kdfLabel...)
 	transcript = append(transcript, byte(scheme))
-	transcript = append(transcript, ephemeral[:]...)
-	transcript = append(transcript, ciphertext...)
-	transcript = append(transcript, recipientX25519[:]...)
-	transcript = append(transcript, recipientKyber...)
+	transcript = appendField(transcript, ephemeral[:])
+	transcript = appendField(transcript, ciphertext)
+	transcript = appendField(transcript, recipientX25519[:])
+	transcript = appendField(transcript, recipientKyber)
 
 	ikm := make([]byte, 0, X25519KeySize+KyberSharedSecretSize)
 	ikm = append(ikm, x25519SS[:]...)
