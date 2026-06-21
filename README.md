@@ -477,11 +477,11 @@ Alice                                            Bob
   |  kyber_ss = Kyber.Decapsulate(                 |
   |    kyber_ct, alice_kyber_priv)                 |
   |                                                |
-  |  shared = HKDF-SHA512(                          |  64 bytes
-  |    ikm  = x25519_ss || kyber_ss,                |
-  |    info = label || scheme || x25519_eph ||      |
-  |           kyber_ct || recipient_x25519 ||       |
-  |           recipient_kyber)                      |
+  |  shared = HKDF-SHA512(                         |  64 bytes
+  |    ikm  = x25519_ss || kyber_ss,               |
+  |    info = label || scheme || x25519_eph ||     |
+  |           kyber_ct || recipient_x25519 ||      |
+  |           recipient_kyber)                     |
   |                                                |
   |  encryption_key = shared[0:32]                 |  ChaCha20-Poly1305
   |  mac_key        = shared[32:64]                |
