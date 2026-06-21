@@ -61,9 +61,9 @@ func DefaultPaddingConfig() *PaddingConfig {
 
 // Padder adds padding to packets
 type Padder struct {
-	cfg  *PaddingConfig
-	rng  *mrand.Rand
-	mu   sync.Mutex
+	cfg *PaddingConfig
+	rng *mrand.Rand
+	mu  sync.Mutex
 }
 
 // NewPadder creates a new padder
@@ -113,7 +113,13 @@ func (p *Padder) Pad(data []byte) []byte {
 	return padded
 }
 
-// Unpad removes padding and returns original data
+// Unpad removes padding and returns original data.
+//
+// On a length header that doesn't fit the buffer it returns the input as-is
+// (lenient) rather than erroring: this header-less format has no total-record
+// framing, so callers (e.g. with padding disabled, or on a coalesced stream)
+// legitimately pass unpadded bytes through. See ObfuscatedConn.Read for the
+// framing limitation that a real stream transport would need to address.
 func (p *Padder) Unpad(padded []byte) ([]byte, error) {
 	if len(padded) < 2 {
 		return padded, nil
@@ -121,7 +127,7 @@ func (p *Padder) Unpad(padded []byte) ([]byte, error) {
 
 	dataLen := int(binary.BigEndian.Uint16(padded[:2]))
 	if dataLen > len(padded)-2 {
-		return padded, nil // Invalid, return as-is
+		return padded, nil // invalid for this buffer — return as-is
 	}
 
 	return padded[2 : 2+dataLen], nil
@@ -136,8 +142,13 @@ func (p *Padder) selectTargetSize(dataLen int) int {
 		return blocks * p.cfg.BlockSize
 
 	case "random":
-		// Random padding within range
-		padding := p.cfg.MinPadding + p.rng.Intn(p.cfg.MaxPadding-p.cfg.MinPadding+1)
+		// Random padding within range. Guard against misconfiguration
+		// (MaxPadding <= MinPadding) which would panic rng.Intn with a
+		// non-positive argument.
+		padding := p.cfg.MinPadding
+		if span := p.cfg.MaxPadding - p.cfg.MinPadding + 1; span > 0 {
+			padding += p.rng.Intn(span)
+		}
 		return dataLen + 2 + padding
 
 	case "mimic":
@@ -197,11 +208,11 @@ func DefaultJitterConfig() *JitterConfig {
 
 // Jitterer adds timing jitter to packet transmission
 type Jitterer struct {
-	cfg         *JitterConfig
-	rng         *mrand.Rand
-	mu          sync.Mutex
-	burstCount  int
-	lastBurst   time.Time
+	cfg        *JitterConfig
+	rng        *mrand.Rand
+	mu         sync.Mutex
+	burstCount int
+	lastBurst  time.Time
 }
 
 // NewJitterer creates a new jitterer
@@ -408,22 +419,32 @@ func (d *DecoyGenerator) nextInterval() time.Duration {
 	minNs := d.cfg.MinInterval.Nanoseconds()
 	maxNs := d.cfg.MaxInterval.Nanoseconds()
 
+	// Guard against MinInterval >= MaxInterval, which would panic rng.Int63n
+	// with a non-positive argument.
+	span := maxNs - minNs
+	if span <= 0 {
+		return time.Duration(minNs)
+	}
+
 	if d.cfg.Pattern == "mimic_browsing" {
 		// Simulate web browsing: bursts followed by pauses
 		if d.rng.Float32() < 0.3 {
 			// Short burst interval
-			return time.Duration(minNs + d.rng.Int63n(maxNs-minNs)/10)
+			return time.Duration(minNs + d.rng.Int63n(span)/10)
 		}
 		// Longer pause
-		return time.Duration(minNs + d.rng.Int63n(maxNs-minNs))
+		return time.Duration(minNs + d.rng.Int63n(span))
 	}
 
-	return time.Duration(minNs + d.rng.Int63n(maxNs-minNs))
+	return time.Duration(minNs + d.rng.Int63n(span))
 }
 
 func (d *DecoyGenerator) sendDecoy() {
 	d.mu.Lock()
-	size := d.cfg.MinSize + d.rng.Intn(d.cfg.MaxSize-d.cfg.MinSize)
+	size := d.cfg.MinSize
+	if span := d.cfg.MaxSize - d.cfg.MinSize; span > 0 {
+		size += d.rng.Intn(span)
+	}
 	d.mu.Unlock()
 
 	// Generate random decoy data
@@ -440,10 +461,10 @@ func (d *DecoyGenerator) sendDecoy() {
 // ObfuscatedConn wraps a connection with obfuscation features
 type ObfuscatedConn struct {
 	net.Conn
-	padder    *Padder
-	jitterer  *Jitterer
-	decoy     *DecoyGenerator
-	readBuf   []byte
+	padder   *Padder
+	jitterer *Jitterer
+	decoy    *DecoyGenerator
+	readBuf  []byte
 }
 
 // NewObfuscatedConn creates an obfuscated connection wrapper
@@ -462,6 +483,15 @@ func NewObfuscatedConn(conn net.Conn, padCfg *PaddingConfig, jitCfg *JitterConfi
 	return oc
 }
 
+// Read returns the next unpadded record.
+//
+// LIMITATION: the padded wire format ([dataLen:2][data][padding]) carries no
+// total-record-length prefix, so this method assumes each underlying Conn.Read
+// returns exactly one full padded record (datagram-like). Over a TCP stream
+// that coalesces/splits writes this assumption can desync. Before wiring
+// ObfuscatedConn into a stream transport, the format must gain a total-length
+// prefix and this loop must buffer/reassemble on it. (ObfuscatedConn currently
+// has no production callers.)
 func (oc *ObfuscatedConn) Read(b []byte) (int, error) {
 	// Return buffered data first
 	if len(oc.readBuf) > 0 {

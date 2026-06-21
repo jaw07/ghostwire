@@ -1,9 +1,18 @@
 package https
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"time"
+)
+
+const (
+	// tunnelIdleTimeout reaps a tunnel connection that goes silent.
+	tunnelIdleTimeout = 5 * time.Minute
+	// maxConsecutiveControlFrames bounds ping/unknown frames between data
+	// frames, so a peer cannot pin the read loop emitting ping replies.
+	maxConsecutiveControlFrames = 64
 )
 
 // TunnelConn wraps a connection with tunnel framing
@@ -35,6 +44,7 @@ func (tc *TunnelConn) Read(b []byte) (int, error) {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 
+	controlFrames := 0
 	for {
 		// If we have buffered data, return it first
 		if tc.readOffset < len(tc.readBuf) {
@@ -47,6 +57,9 @@ func (tc *TunnelConn) Read(b []byte) (int, error) {
 			return n, nil
 		}
 
+		// Idle deadline: reap a connection that stops sending frames.
+		tc.conn.SetReadDeadline(time.Now().Add(tunnelIdleTimeout))
+
 		// Read next frame
 		frame, err := tc.reader.ReadFrame()
 		if err != nil {
@@ -55,6 +68,7 @@ func (tc *TunnelConn) Read(b []byte) (int, error) {
 
 		switch frame.Type {
 		case FrameTypeData:
+			controlFrames = 0
 			// Copy data to buffer
 			if len(frame.Payload) <= len(b) {
 				return copy(b, frame.Payload), nil
@@ -66,7 +80,12 @@ func (tc *TunnelConn) Read(b []byte) (int, error) {
 			return n, nil
 
 		case FrameTypePing:
-			// Respond with ping and loop to read next frame
+			// Respond with ping and loop, but cap consecutive control frames so
+			// a peer can't pin this loop generating ping replies.
+			controlFrames++
+			if controlFrames > maxConsecutiveControlFrames {
+				return 0, fmt.Errorf("too many consecutive control frames")
+			}
 			tc.writer.WriteFrame(NewPingFrame())
 			continue
 
@@ -75,7 +94,11 @@ func (tc *TunnelConn) Read(b []byte) (int, error) {
 			return 0, net.ErrClosed
 
 		default:
-			// Unknown frame type - skip and loop
+			// Unknown frame type - skip and loop (bounded)
+			controlFrames++
+			if controlFrames > maxConsecutiveControlFrames {
+				return 0, fmt.Errorf("too many consecutive control frames")
+			}
 			continue
 		}
 	}

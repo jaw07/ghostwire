@@ -5,13 +5,17 @@ package quic
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"sync"
@@ -171,17 +175,16 @@ func (t *Transport) Dial(ctx context.Context, addr string) (net.Conn, error) {
 	return transport.NewConnWrapper(qc, Name, t.cfg.LocalPublicKey), nil
 }
 
-// authenticate sends mesh authentication over the stream
+// authenticate sends mesh authentication over the stream:
+// timestamp(8) || HMAC-SHA256(meshSecret, timestamp)(32).
 func (t *Transport) authenticate(stream *quic.Stream) error {
-	// Simple knock: timestamp + HMAC
 	timestamp := time.Now().Unix()
 	msg := make([]byte, 8+32)
 	binary.BigEndian.PutUint64(msg[:8], uint64(timestamp))
 
-	// Simple HMAC-like: XOR mesh secret with timestamp
-	for i := 0; i < 32 && i < len(t.cfg.MeshSecret); i++ {
-		msg[8+i] = t.cfg.MeshSecret[i] ^ byte(timestamp>>(i%8))
-	}
+	mac := hmac.New(sha256.New, t.cfg.MeshSecret)
+	mac.Write(msg[:8])
+	copy(msg[8:], mac.Sum(nil))
 
 	_, err := (*stream).Write(msg)
 	return err
@@ -321,9 +324,9 @@ func (l *quicListener) Accept() (net.Conn, error) {
 
 func (l *quicListener) verifyAuth(stream *quic.Stream) ([]byte, error) {
 	msg := make([]byte, 40)
-	n, err := (*stream).Read(msg)
-	if err != nil || n < 40 {
-		return nil, fmt.Errorf("read auth failed")
+	// ReadFull: a single Read is not guaranteed to return all 40 bytes.
+	if _, err := io.ReadFull(stream, msg); err != nil {
+		return nil, fmt.Errorf("read auth failed: %w", err)
 	}
 
 	timestamp := int64(binary.BigEndian.Uint64(msg[:8]))
@@ -333,16 +336,15 @@ func (l *quicListener) verifyAuth(stream *quic.Stream) ([]byte, error) {
 		return nil, fmt.Errorf("stale timestamp")
 	}
 
-	// Verify HMAC
-	expected := make([]byte, 32)
-	for i := 0; i < 32 && i < len(l.transport.cfg.MeshSecret); i++ {
-		expected[i] = l.transport.cfg.MeshSecret[i] ^ byte(timestamp>>(i%8))
-	}
+	// Verify HMAC-SHA256(meshSecret, timestamp) in constant time. (The previous
+	// XOR construction was forgeable and leaked the mesh secret to any observer
+	// of one valid auth.)
+	mac := hmac.New(sha256.New, l.transport.cfg.MeshSecret)
+	mac.Write(msg[:8])
+	expected := mac.Sum(nil)
 
-	for i := range expected {
-		if msg[8+i] != expected[i] {
-			return nil, fmt.Errorf("invalid auth")
-		}
+	if subtle.ConstantTimeCompare(msg[8:40], expected) != 1 {
+		return nil, fmt.Errorf("invalid auth")
 	}
 
 	return nil, nil // Could extract peer pubkey from extended auth

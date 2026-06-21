@@ -329,10 +329,10 @@ func GenerateKnock(meshSecret []byte) string {
 
 // rateLimiter implements token bucket rate limiting per IP
 type rateLimiter struct {
-	cfg      *RateLimitConfig
-	buckets  map[string]*bucket
-	blocked  map[string]time.Time
-	mu       sync.RWMutex
+	cfg     *RateLimitConfig
+	buckets map[string]*bucket
+	blocked map[string]time.Time
+	mu      sync.RWMutex
 }
 
 type bucket struct {
@@ -351,9 +351,40 @@ func newRateLimiter(cfg *RateLimitConfig) *rateLimiter {
 	}
 }
 
+// maxTrackedIPs bounds the per-IP rate-limiter state so a flood of distinct
+// (or spoofed) source IPs cannot grow these maps without limit.
+const maxTrackedIPs = 10000
+
+// pruneLocked drops expired blocks and fully-refilled (idle) buckets, and as a
+// last resort clears the maps if they are still pathologically large. Caller
+// must hold rl.mu.
+func (rl *rateLimiter) pruneLocked(now time.Time) {
+	for ip, until := range rl.blocked {
+		if now.After(until) {
+			delete(rl.blocked, ip)
+		}
+	}
+	for ip, b := range rl.buckets {
+		// A bucket at full tokens carries no rate-limit state worth keeping.
+		if b.tokens >= float64(rl.cfg.BurstSize) {
+			delete(rl.buckets, ip)
+		}
+	}
+	if len(rl.buckets) > maxTrackedIPs {
+		rl.buckets = make(map[string]*bucket)
+	}
+	if len(rl.blocked) > maxTrackedIPs {
+		rl.blocked = make(map[string]time.Time)
+	}
+}
+
 func (rl *rateLimiter) Allow(ip string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
+
+	if len(rl.buckets) > maxTrackedIPs || len(rl.blocked) > maxTrackedIPs {
+		rl.pruneLocked(time.Now())
+	}
 
 	// Check if blocked
 	if blockUntil, ok := rl.blocked[ip]; ok {
@@ -489,8 +520,25 @@ func (pd *ProbeDetector) Detect(r *http.Request, body []byte) []string {
 
 	if len(matches) > 0 {
 		ip := extractClientIP(r)
+		now := time.Now()
 		pd.mu.Lock()
-		pd.detections[ip] = append(pd.detections[ip], time.Now())
+		// Bound tracked IPs and keep only recent, capped detections per IP so
+		// the map/slices can't grow without limit from many source IPs.
+		if len(pd.detections) > maxTrackedIPs {
+			pd.detections = make(map[string][]time.Time)
+		}
+		d := append(pd.detections[ip], now)
+		cutoff := now.Add(-time.Hour)
+		trimmed := d[:0]
+		for _, t := range d {
+			if t.After(cutoff) {
+				trimmed = append(trimmed, t)
+			}
+		}
+		if len(trimmed) > 64 {
+			trimmed = trimmed[len(trimmed)-64:]
+		}
+		pd.detections[ip] = trimmed
 		pd.mu.Unlock()
 	}
 
@@ -617,16 +665,11 @@ func looksLikeTLS(b []byte) bool {
 // Helper functions
 
 func extractClientIP(r *http.Request) string {
-	// Check X-Forwarded-For first
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[0])
-	}
-	// Check X-Real-IP
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-	// Fall back to RemoteAddr
+	// Use the real transport peer address only. X-Forwarded-For / X-Real-IP are
+	// client-supplied and trivially spoofed; trusting them on a directly-exposed
+	// listener would let an attacker evade rate-limiting (rotate the keyed IP) or
+	// poison another IP's probe reputation. A trusted reverse proxy would have to
+	// be handled explicitly via configuration, not by blindly reading headers.
 	return extractIPFromAddr(r.RemoteAddr)
 }
 
