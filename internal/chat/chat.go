@@ -5,6 +5,11 @@ import (
 	"time"
 )
 
+// MaxTextLen bounds a chat message body. Remote messages larger than this are
+// dropped (a peer could otherwise fill bounded history with huge messages);
+// locally-sent messages are truncated.
+const MaxTextLen = 4096
+
 // ChatMessage represents a single chat message in the mesh network.
 type ChatMessage struct {
 	Sender    string `json:"sender"`
@@ -14,10 +19,10 @@ type ChatMessage struct {
 
 // Service manages sending, receiving, and history of chat messages.
 type Service struct {
-	nodeID   string
-	messages []ChatMessage
-	maxHist  int
-	mu       sync.Mutex
+	nodeID    string
+	messages  []ChatMessage
+	maxHist   int
+	mu        sync.Mutex
 	OnSend    func(ChatMessage) // called when this node sends
 	OnReceive func(ChatMessage) // called when remote message arrives
 }
@@ -25,14 +30,17 @@ type Service struct {
 // New creates a new chat Service for the given nodeID with a bounded history.
 func New(nodeID string, maxHistory int) *Service {
 	return &Service{
-		nodeID:  nodeID,
-		maxHist: maxHistory,
+		nodeID:   nodeID,
+		maxHist:  maxHistory,
 		messages: make([]ChatMessage, 0, maxHistory),
 	}
 }
 
 // Send creates a message from this node, appends it to history, and calls OnSend.
 func (s *Service) Send(text string) {
+	if len(text) > MaxTextLen {
+		text = text[:MaxTextLen]
+	}
 	msg := ChatMessage{
 		Sender:    s.nodeID,
 		Text:      text,
@@ -54,6 +62,10 @@ func (s *Service) Send(text string) {
 // Otherwise the message is appended to history and OnReceive is called.
 func (s *Service) Receive(msg ChatMessage) {
 	if msg.Sender == s.nodeID {
+		return
+	}
+	// Drop oversized messages from peers rather than storing them in history.
+	if len(msg.Text) > MaxTextLen {
 		return
 	}
 

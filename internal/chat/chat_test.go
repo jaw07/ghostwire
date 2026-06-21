@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -134,5 +135,32 @@ func TestIgnoreOwnMessages(t *testing.T) {
 	}
 	if len(s.History()) != 0 {
 		t.Fatal("own message should not appear in history")
+	}
+}
+
+func TestReceiveDropsOversized(t *testing.T) {
+	s := New("self", 10)
+	received := 0
+	s.OnReceive = func(ChatMessage) { received++ }
+
+	s.Receive(ChatMessage{Sender: "peer", Text: strings.Repeat("x", MaxTextLen+1)})
+	if received != 0 || len(s.History()) != 0 {
+		t.Errorf("oversized message should be dropped: received=%d history=%d", received, len(s.History()))
+	}
+
+	s.Receive(ChatMessage{Sender: "peer", Text: "hi"})
+	if received != 1 || len(s.History()) != 1 {
+		t.Errorf("in-bounds message should be accepted: received=%d history=%d", received, len(s.History()))
+	}
+}
+
+func TestSendTruncatesOversized(t *testing.T) {
+	s := New("self", 10)
+	var sent ChatMessage
+	s.OnSend = func(m ChatMessage) { sent = m }
+
+	s.Send(strings.Repeat("y", MaxTextLen+100))
+	if len(sent.Text) != MaxTextLen {
+		t.Errorf("Send should truncate to %d, got %d", MaxTextLen, len(sent.Text))
 	}
 }
