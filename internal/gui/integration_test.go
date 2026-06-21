@@ -1,6 +1,7 @@
 package gui
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -146,7 +147,7 @@ func TestGUIIntegration(t *testing.T) {
 	}
 
 	// Stop server
-	if err := s.Stop(nil); err != nil {
+	if err := s.Stop(context.Background()); err != nil {
 		t.Errorf("Stop error: %v", err)
 	}
 

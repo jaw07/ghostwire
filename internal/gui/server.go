@@ -141,6 +141,12 @@ func (s *Server) Start() error {
 
 // Stop stops the GUI server
 func (s *Server) Stop(ctx context.Context) error {
+	// http.Server.Shutdown dereferences ctx.Done(); a nil context panics once
+	// any connection lingers past the first poll. Be defensive.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
