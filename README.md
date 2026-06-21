@@ -48,7 +48,7 @@ without a TTY. See [deploy/k8s](deploy/k8s/README.md) for a Kubernetes example.
 
 ```
 CLI
-  init | join | up | down | status | panic | enroll
+  init | join | up | down | status | enroll | token | panic | version
 Mesh
   SWIM gossip (UDP 7947, HMAC-SHA256, replay dedup)
   Routing table (direct / relay / multi-hop)
@@ -253,7 +253,7 @@ This shared keypair is **intentional and load-bearing**: a node's CA-signed Ed25
 
 ## Gossip
 
-SWIM (Scalable Weakly-consistent Infection-style Membership) over UDP port 7946.
+SWIM (Scalable Weakly-consistent Infection-style Membership) over UDP port 7947.
 
 ### Protocol cycles
 
@@ -270,10 +270,12 @@ Every 2 seconds (probe):
 
 Every 1 second (gossip):
   1. Pick random alive member
-  2. Send Sync{digest=SHA256(all member incarnations)}
-  3. If digests differ: recipient responds with full member list
-  4. Merge received state
+  2. Send Sync (carries a state digest)
+  3. Recipient replies with its full member list
+  4. Merge received state (incarnation + state precedence)
 ```
+
+The Sync digest is currently advisory: each node's digest covers only its own member view (excluding self), so two nodes' digests never match even when in sync, and the recipient always returns the full list. Skipping the list when states agree would require a canonical cluster-state digest.
 
 ### Message authentication
 
@@ -285,7 +287,10 @@ HMAC = HMAC-SHA256(mesh_secret,
   seqno(8 bytes) ||
   target(string) ||
   digest(bytes) ||
-  for each member: nodeID || state(1 byte) || incarnation(8 bytes)
+  payload(bytes) ||
+  for each member: nodeID || state || incarnation ||
+                   publicKey || meshIP || transport ||
+                   endpoints || roles    (NUL-separated)
 )[0:16]
 
 Verification:
@@ -303,10 +308,14 @@ For incoming member M with incarnation I and state S:
   If M not in local list: add, trigger onJoin callback
   If M.incarnation > local.incarnation: update (higher incarnation wins)
   If M.incarnation == local.incarnation:
-    If state_priority(M.state) > state_priority(local.state): update
-    Where priority: Dead(3) > Suspect(2) > Alive(1) > Left(0)
+    If M.state > local.state: update (higher state value wins)
+    Where state values: Alive(0) < Suspect(1) < Dead(2) < Left(3)
   If M.incarnation < local.incarnation: ignore (stale)
 ```
+
+A confirmed-dead member is only promoted to dead from the suspect state (SWIM
+refutation): a node that gossips a higher incarnation back to Alive during the
+suspicion window is spared.
 
 ## Policy engine
 
