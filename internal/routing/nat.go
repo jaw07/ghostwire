@@ -2,6 +2,7 @@ package routing
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -13,12 +14,12 @@ import (
 type NATType uint8
 
 const (
-	NATNone         NATType = iota // No NAT, public IP
-	NATFull                        // Full cone NAT (easiest)
-	NATRestricted                  // Address-restricted cone
-	NATPortRestricted              // Port-restricted cone
-	NATSymmetric                   // Symmetric NAT (hardest)
-	NATUnknown                     // Not yet determined
+	NATNone           NATType = iota // No NAT, public IP
+	NATFull                          // Full cone NAT (easiest)
+	NATRestricted                    // Address-restricted cone
+	NATPortRestricted                // Port-restricted cone
+	NATSymmetric                     // Symmetric NAT (hardest)
+	NATUnknown                       // Not yet determined
 )
 
 func (n NATType) String() string {
@@ -273,8 +274,13 @@ func (nt *NATTraversal) InitiateHolePunch(ctx context.Context, peerID string, pe
 		return "", fmt.Errorf("no relay configured for hole punch coordination")
 	}
 
-	// Create hole punch request
+	// Create hole punch request with a random nonce. Previously the nonce was
+	// all-zero, so acks carried no replay protection and weren't bound to a
+	// specific request.
 	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		return "", fmt.Errorf("generate hole-punch nonce: %w", err)
+	}
 	req := &HolePunchRequest{
 		FromNodeID: nt.localID,
 		ToNodeID:   peerID,
@@ -339,11 +345,22 @@ func (nt *NATTraversal) InitiateHolePunch(ctx context.Context, peerID string, pe
 	}
 }
 
-// HandleHolePunchRequest processes an incoming hole punch coordination request
+// HandleHolePunchRequest processes an incoming hole punch coordination request.
+//
+// SECURITY: this sends packets to req.FromAddr, an address named in the
+// request. Before wiring NAT traversal into production, the caller MUST
+// authenticate that the request actually came from the trusted relay
+// (e.g. verify the source against nt.relayAddr and authenticate the request),
+// and rate-limit per source — otherwise a forged request turns this node into
+// a UDP reflector toward an arbitrary victim. As a minimal guard we refuse
+// obviously non-routable targets and require a present nonce.
 func (nt *NATTraversal) HandleHolePunchRequest(req *HolePunchRequest) {
-	// Send punch packets to the requester's address
+	if len(req.Nonce) != 16 {
+		return
+	}
 	peerUDP, err := net.ResolveUDPAddr("udp", req.FromAddr)
-	if err != nil {
+	if err != nil || peerUDP.IP == nil ||
+		peerUDP.IP.IsLoopback() || peerUDP.IP.IsUnspecified() || peerUDP.IP.IsMulticast() {
 		return
 	}
 

@@ -14,6 +14,14 @@ import (
 	"filippo.io/age"
 )
 
+const (
+	// maxLogReadBytes caps the (decompressed) bytes read from a log file, to
+	// bound memory against a gzip decompression bomb.
+	maxLogReadBytes = 256 << 20 // 256 MiB
+	// maxLogEntries caps the number of parsed entries held in memory.
+	maxLogEntries = 1 << 20
+)
+
 // Reader reads and decrypts log files
 type Reader struct {
 	passphrase string
@@ -46,6 +54,10 @@ func (r *Reader) ReadFile(path string) ([]*Entry, error) {
 		reader = f
 	}
 
+	// Cap how much (decompressed) input we read, so a crafted .gz can't blow up
+	// memory via a decompression bomb.
+	reader = io.LimitReader(reader, maxLogReadBytes)
+
 	return r.readEntries(reader)
 }
 
@@ -59,6 +71,9 @@ func (r *Reader) readEntries(reader io.Reader) ([]*Entry, error) {
 	scanner.Buffer(buf, 1024*1024)
 
 	for scanner.Scan() {
+		if len(entries) >= maxLogEntries {
+			break
+		}
 		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue
@@ -130,13 +145,13 @@ func (r *Reader) decryptSensitive(encrypted []byte) (*SensitiveFields, error) {
 
 // Filter specifies criteria for filtering log entries
 type Filter struct {
-	Level       *Level
-	MinLevel    *Level
-	Component   string
-	NodeID      string
-	StartTime   *time.Time
-	EndTime     *time.Time
-	MessageLike string
+	Level        *Level
+	MinLevel     *Level
+	Component    string
+	NodeID       string
+	StartTime    *time.Time
+	EndTime      *time.Time
+	MessageLike  string
 	HasSensitive bool
 }
 

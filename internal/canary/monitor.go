@@ -87,13 +87,22 @@ func (m *Monitor) Register(c *Canary) error {
 	return nil
 }
 
+// shortID safely truncates a canary ID for error messages (IDs may be shorter
+// than 8 characters, so a fixed id[:8] slice would panic).
+func shortID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
+}
+
 // Unregister removes a canary from the monitor
 func (m *Monitor) Unregister(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if _, exists := m.canaries[id]; !exists {
-		return fmt.Errorf("canary %s not found", id[:8])
+		return fmt.Errorf("canary %s not found", shortID(id))
 	}
 
 	delete(m.canaries, id)
@@ -154,7 +163,7 @@ func (m *Monitor) CheckIn(id string) error {
 
 	c, ok := m.canaries[id]
 	if !ok {
-		return fmt.Errorf("canary %s not found", id[:8])
+		return fmt.Errorf("canary %s not found", shortID(id))
 	}
 
 	if c.Type != TypeDeadSwitch {
@@ -188,7 +197,7 @@ func (m *Monitor) TriggerTripwire(id string, source string) error {
 	c, ok := m.canaries[id]
 	if !ok {
 		m.mu.Unlock()
-		return fmt.Errorf("canary %s not found", id[:8])
+		return fmt.Errorf("canary %s not found", shortID(id))
 	}
 
 	if c.Type != TypeTripwire {
@@ -213,7 +222,7 @@ func (m *Monitor) TriggerHoneypot(id string, attemptType, attemptData string) er
 	c, ok := m.canaries[id]
 	if !ok {
 		m.mu.Unlock()
-		return fmt.Errorf("canary %s not found", id[:8])
+		return fmt.Errorf("canary %s not found", shortID(id))
 	}
 
 	if c.Type != TypeHoneypot {
@@ -352,12 +361,12 @@ func (m *Monitor) CreateHoneypot(description, value string) (*Canary, error) {
 
 // Stats returns monitor statistics
 type Stats struct {
-	TotalCanaries   int
-	DeadSwitches    int
-	Tripwires       int
-	Honeypots       int
-	TriggeredCount  int
-	OverdueCount    int
+	TotalCanaries  int
+	DeadSwitches   int
+	Tripwires      int
+	Honeypots      int
+	TriggeredCount int
+	OverdueCount   int
 }
 
 // Stats returns current monitor statistics

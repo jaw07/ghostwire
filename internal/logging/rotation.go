@@ -59,6 +59,17 @@ func (r *Rotator) Rotate(filename string) error {
 	rotatedName := fmt.Sprintf("%s.%s%s", name, timestamp, ext)
 	rotatedPath := filepath.Join(dir, rotatedName)
 
+	// Two rotations within the same second would otherwise collide and the
+	// second os.Rename would clobber the first (silent log loss). Append a
+	// counter until we find a free name.
+	for i := 1; ; i++ {
+		if _, err := os.Stat(rotatedPath); os.IsNotExist(err) {
+			break
+		}
+		rotatedName = fmt.Sprintf("%s.%s-%d%s", name, timestamp, i, ext)
+		rotatedPath = filepath.Join(dir, rotatedName)
+	}
+
 	// Rename current file
 	if err := os.Rename(filename, rotatedPath); err != nil {
 		return fmt.Errorf("rename log file: %w", err)

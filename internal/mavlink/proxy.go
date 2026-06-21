@@ -53,6 +53,7 @@ type Proxy struct {
 	// clientAddr is the most-recently-seen remote sender address.
 	mu         sync.Mutex
 	clientAddr *net.UDPAddr
+	stopped    bool // set by Stop; guards against wg.Add after Wait
 
 	// remoteConns are outbound UDP connections to other mesh nodes
 	remoteConns []*net.UDPConn
@@ -116,13 +117,23 @@ func (p *Proxy) Start() error {
 	return nil
 }
 
-// Stop closes the UDP socket and waits for the read loop to exit.
+// Stop closes the UDP socket and waits for the read loops to exit. It is
+// idempotent and safe to call concurrently with AddTarget.
 func (p *Proxy) Stop() {
+	p.mu.Lock()
+	if p.stopped {
+		p.mu.Unlock()
+		return
+	}
+	p.stopped = true
+	conns := p.remoteConns
+	p.mu.Unlock()
+
 	close(p.done)
 	if p.conn != nil {
 		p.conn.Close()
 	}
-	for _, rc := range p.remoteConns {
+	for _, rc := range conns {
 		rc.Close()
 	}
 	p.wg.Wait()
@@ -140,10 +151,16 @@ func (p *Proxy) AddTarget(addr string) error {
 		return err
 	}
 	p.mu.Lock()
+	if p.stopped {
+		// Don't wg.Add after Stop began its Wait, and don't leak the conn.
+		p.mu.Unlock()
+		rc.Close()
+		return fmt.Errorf("mavlink proxy: stopped")
+	}
 	p.remoteConns = append(p.remoteConns, rc)
+	p.wg.Add(1) // under the lock, before Stop can set stopped and Wait
 	p.mu.Unlock()
 
-	p.wg.Add(1)
 	go p.remoteReadLoop(rc)
 	return nil
 }
@@ -174,6 +191,9 @@ func (p *Proxy) Deliver(data []byte) error {
 
 	if addr == nil {
 		return fmt.Errorf("mavlink proxy: no known client address")
+	}
+	if p.conn == nil {
+		return fmt.Errorf("mavlink proxy: not started")
 	}
 
 	n, err := p.conn.WriteToUDP(data, addr)

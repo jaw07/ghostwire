@@ -79,23 +79,23 @@ func TestDeadSwitchCheckIn(t *testing.T) {
 		t.Error("Should not be due immediately")
 	}
 
-	// Wait until due
+	// Wait until due (~1 missed interval). RecordMiss counts elapsed intervals,
+	// so one missed window must not yet reach the threshold of 2.
 	time.Sleep(150 * time.Millisecond)
 	if !c.IsDue() {
 		t.Error("Should be due after interval")
 	}
-
-	// Record first miss
 	if c.RecordMiss() {
-		t.Error("Should not trigger after first miss")
+		t.Error("Should not trigger after 1 missed interval")
 	}
 	if c.MissedCount != 1 {
 		t.Errorf("MissedCount = %d, want 1", c.MissedCount)
 	}
 
-	// Record second miss (threshold)
+	// After a second missed interval elapses, the threshold (2) is reached.
+	time.Sleep(120 * time.Millisecond) // ~2.7 intervals total
 	if !c.RecordMiss() {
-		t.Error("Should trigger after reaching threshold")
+		t.Error("Should trigger after 2 missed intervals (threshold)")
 	}
 
 	// Check-in resets
