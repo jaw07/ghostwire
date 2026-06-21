@@ -141,8 +141,8 @@ func (d *TLSDialer) getClientHelloID() utls.ClientHelloID {
 // FingerprintConn wraps a connection with fingerprint-aware functionality
 type FingerprintConn struct {
 	net.Conn
-	profile     BrowserProfile
-	serverName  string
+	profile         BrowserProfile
+	serverName      string
 	negotiatedProto string
 }
 
@@ -208,8 +208,8 @@ func (d *TLSDialer) HTTP2Settings() map[string]uint32 {
 		}
 	default:
 		return map[string]uint32{
-			"HEADER_TABLE_SIZE":      65536,
-			"INITIAL_WINDOW_SIZE":    6291456,
+			"HEADER_TABLE_SIZE":   65536,
+			"INITIAL_WINDOW_SIZE": 6291456,
 		}
 	}
 }

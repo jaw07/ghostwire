@@ -9,8 +9,8 @@ import (
 )
 
 var (
-	kernel32        = windows.NewLazySystemDLL("kernel32.dll")
-	procVirtualLock = kernel32.NewProc("VirtualLock")
+	kernel32          = windows.NewLazySystemDLL("kernel32.dll")
+	procVirtualLock   = kernel32.NewProc("VirtualLock")
 	procVirtualUnlock = kernel32.NewProc("VirtualUnlock")
 )
 

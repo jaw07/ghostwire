@@ -8,11 +8,11 @@ import (
 
 // Predefined compartment names
 const (
-	CompartmentCA       = "ca_keys"      // CA private key (admin only)
-	CompartmentNode     = "node_keys"    // Node private keys
-	CompartmentSession  = "session_keys" // Ephemeral session keys
-	CompartmentTokens   = "tokens"       // Active tokens
-	CompartmentSecrets  = "mesh_secrets" // Shared mesh secrets
+	CompartmentCA      = "ca_keys"      // CA private key (admin only)
+	CompartmentNode    = "node_keys"    // Node private keys
+	CompartmentSession = "session_keys" // Ephemeral session keys
+	CompartmentTokens  = "tokens"       // Active tokens
+	CompartmentSecrets = "mesh_secrets" // Shared mesh secrets
 )
 
 // Region represents an isolated memory region for sensitive data

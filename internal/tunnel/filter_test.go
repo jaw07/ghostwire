@@ -11,10 +11,10 @@ import (
 // fakeTUN is a minimal tun.Device for exercising filteredTUN. Read replays a
 // queued batch of packets; Write records what it was handed.
 type fakeTUN struct {
-	mu       sync.Mutex
-	toRead   [][]byte // packets to hand out on the next Read
-	written  [][]byte // packets passed through to Write
-	events   chan tun.Event
+	mu      sync.Mutex
+	toRead  [][]byte // packets to hand out on the next Read
+	written [][]byte // packets passed through to Write
+	events  chan tun.Event
 }
 
 func newFakeTUN() *fakeTUN { return &fakeTUN{events: make(chan tun.Event)} }

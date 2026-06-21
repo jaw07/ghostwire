@@ -129,9 +129,9 @@ func TestParseTooShort(t *testing.T) {
 		data []byte
 	}{
 		{"empty", []byte{}},
-		{"v1 header truncated", []byte{MagicV1, 0x09}},           // only 2 bytes
-		{"v1 payload truncated", buildV1Packet(9, 1, 1, 1, 0)[:7]}, // strip payload+CRC
-		{"v2 header truncated", []byte{MagicV2, 0x09, 0x00}},     // only 3 bytes
+		{"v1 header truncated", []byte{MagicV1, 0x09}},              // only 2 bytes
+		{"v1 payload truncated", buildV1Packet(9, 1, 1, 1, 0)[:7]},  // strip payload+CRC
+		{"v2 header truncated", []byte{MagicV2, 0x09, 0x00}},        // only 3 bytes
 		{"v2 payload truncated", buildV2Packet(9, 1, 1, 1, 0)[:11]}, // strip payload+CRC
 	}
 

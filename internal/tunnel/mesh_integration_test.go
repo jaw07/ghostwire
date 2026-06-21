@@ -36,10 +36,10 @@ func (e *memEndpoint) SrcIP() netip.Addr { return netip.Addr{} }
 // memBind implements conn.Bind backed by in-memory channels.
 // Packets sent via Send() are delivered to the peer's receive channel.
 type memBind struct {
-	mu      sync.Mutex
-	recvCh  chan memPacket
-	peers   map[string]*memBind // endpoint addr -> peer bind
-	closed  bool
+	mu     sync.Mutex
+	recvCh chan memPacket
+	peers  map[string]*memBind // endpoint addr -> peer bind
+	closed bool
 }
 
 type memPacket struct {

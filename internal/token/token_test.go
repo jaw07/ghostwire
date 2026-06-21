@@ -184,10 +184,10 @@ func TestTokenInvalidFormat(t *testing.T) {
 	invalidTokens := []string{
 		"",
 		"not_a_token",
-		"gw_enroll_",                          // Empty payload
-		"gw_enroll_invalid_base64!@#$",        // Invalid base64
-		"gw_enroll_dG9vX3Nob3J0",              // Too short
-		"wrong_prefix_" + "dGVzdA",            // Wrong prefix
+		"gw_enroll_",                   // Empty payload
+		"gw_enroll_invalid_base64!@#$", // Invalid base64
+		"gw_enroll_dG9vX3Nob3J0",       // Too short
+		"wrong_prefix_" + "dGVzdA",     // Wrong prefix
 	}
 
 	for _, invalidToken := range invalidTokens {

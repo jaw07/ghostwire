@@ -117,12 +117,12 @@ func (t *Transport) Dial(ctx context.Context, addr string) (net.Conn, error) {
 
 	// Create DNS tunnel connection
 	dc := &dnsConn{
-		transport: t,
-		sessionID: sessionID,
-		sendCh:    make(chan []byte, 100),
-		recvCh:    make(chan []byte, 100),
-		closeCh:   make(chan struct{}),
-		localAddr: &dnsAddr{network: "dns", addr: "local"},
+		transport:  t,
+		sessionID:  sessionID,
+		sendCh:     make(chan []byte, 100),
+		recvCh:     make(chan []byte, 100),
+		closeCh:    make(chan struct{}),
+		localAddr:  &dnsAddr{network: "dns", addr: "local"},
 		remoteAddr: &dnsAddr{network: "dns", addr: t.cfg.Domain},
 	}
 

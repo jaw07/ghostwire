@@ -169,8 +169,8 @@ func (v *Validator) GetUsageCount(tokenID [TokenIDLength]byte) int {
 
 // UsageTracker tracks token usage to enforce limits
 type UsageTracker struct {
-	mu    sync.Mutex
-	uses  map[[TokenIDLength]byte]int
+	mu   sync.Mutex
+	uses map[[TokenIDLength]byte]int
 }
 
 // NewUsageTracker creates a new usage tracker

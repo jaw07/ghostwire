@@ -108,10 +108,10 @@ type PolicySet struct {
 // Request represents an access control request
 type Request struct {
 	// Source information
-	SourceNodeID    string
-	SourceRoles     []string
+	SourceNodeID      string
+	SourceRoles       []string
 	SourceCompartment string
-	SourceIP        netip.Addr
+	SourceIP          netip.Addr
 
 	// Destination information
 	DestNodeID      string
@@ -130,9 +130,9 @@ type Request struct {
 
 // Decision is the result of policy evaluation
 type Decision struct {
-	Effect     Effect
-	Rule       *Rule
-	Reason     string
+	Effect Effect
+	Rule   *Rule
+	Reason string
 }
 
 // Engine evaluates access control policies
@@ -386,18 +386,18 @@ func (e *Engine) resourcesMatch(spec *ResourceSpec, req *Request) bool {
 
 func (e *Engine) evaluateCondition(rule *Rule, req *Request) bool {
 	vars := map[string]interface{}{
-		"source_node_id":    req.SourceNodeID,
-		"source_roles":      req.SourceRoles,
+		"source_node_id":     req.SourceNodeID,
+		"source_roles":       req.SourceRoles,
 		"source_compartment": req.SourceCompartment,
-		"source_ip":         req.SourceIP.String(),
-		"dest_node_id":      req.DestNodeID,
-		"dest_roles":        req.DestRoles,
-		"dest_compartment":  req.DestCompartment,
-		"dest_ip":           req.DestIP.String(),
-		"dest_port":         int64(req.DestPort),
-		"protocol":          req.Protocol,
-		"direction":         req.Direction,
-		"metadata":          req.Metadata,
+		"source_ip":          req.SourceIP.String(),
+		"dest_node_id":       req.DestNodeID,
+		"dest_roles":         req.DestRoles,
+		"dest_compartment":   req.DestCompartment,
+		"dest_ip":            req.DestIP.String(),
+		"dest_port":          int64(req.DestPort),
+		"protocol":           req.Protocol,
+		"direction":          req.Direction,
+		"metadata":           req.Metadata,
 	}
 
 	out, _, err := rule.program.Eval(vars)
