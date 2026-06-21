@@ -14,9 +14,9 @@ import (
 type RouteType uint8
 
 const (
-	RouteDirect RouteType = iota // Direct WireGuard connection
-	RouteRelay                   // Via a relay node
-	RouteMultiHop                // Through multiple relays
+	RouteDirect   RouteType = iota // Direct WireGuard connection
+	RouteRelay                     // Via a relay node
+	RouteMultiHop                  // Through multiple relays
 )
 
 func (r RouteType) String() string {
@@ -64,12 +64,12 @@ type Route struct {
 
 // Table manages routes to mesh nodes
 type Table struct {
-	mu        sync.RWMutex
-	routes    map[string][]*Route // nodeID -> routes (multiple paths)
-	localID   string
-	localIP   netip.Addr
-	maxHops   int
-	onChange  func(nodeID string, routes []*Route)
+	mu       sync.RWMutex
+	routes   map[string][]*Route // nodeID -> routes (multiple paths)
+	localID  string
+	localIP  netip.Addr
+	maxHops  int
+	onChange func(nodeID string, routes []*Route)
 }
 
 // NewTable creates a new routing table
@@ -177,6 +177,20 @@ func (t *Table) UpdateFromGossip(members *gossip.MemberList) {
 	t.routes = newRoutes
 }
 
+// cloneRoute returns a copy of a route so callers never hold a pointer into the
+// mutex-guarded table (UpdateMetrics mutates route fields under the lock).
+func cloneRoute(r *Route) *Route {
+	if r == nil {
+		return nil
+	}
+	c := *r
+	if r.Path != nil {
+		c.Path = make([]string, len(r.Path))
+		copy(c.Path, r.Path)
+	}
+	return &c
+}
+
 // GetRoute returns the best route to a destination
 func (t *Table) GetRoute(nodeID string) *Route {
 	t.mu.RLock()
@@ -186,7 +200,7 @@ func (t *Table) GetRoute(nodeID string) *Route {
 	if len(routes) == 0 {
 		return nil
 	}
-	return routes[0]
+	return cloneRoute(routes[0])
 }
 
 // GetRouteByIP returns the best route to a mesh IP
@@ -196,7 +210,7 @@ func (t *Table) GetRouteByIP(ip netip.Addr) *Route {
 
 	for _, routes := range t.routes {
 		if len(routes) > 0 && routes[0].DestIP == ip {
-			return routes[0]
+			return cloneRoute(routes[0])
 		}
 	}
 	return nil
@@ -209,7 +223,9 @@ func (t *Table) GetAllRoutes(nodeID string) []*Route {
 
 	routes := t.routes[nodeID]
 	result := make([]*Route, len(routes))
-	copy(result, routes)
+	for i, r := range routes {
+		result[i] = cloneRoute(r)
+	}
 	return result
 }
 
@@ -256,7 +272,7 @@ func (t *Table) All() map[string]*Route {
 	result := make(map[string]*Route)
 	for nodeID, routes := range t.routes {
 		if len(routes) > 0 {
-			result[nodeID] = routes[0]
+			result[nodeID] = cloneRoute(routes[0])
 		}
 	}
 	return result

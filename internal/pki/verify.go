@@ -70,13 +70,13 @@ func (v *Verifier) VerifyCertificate(cert *x509.Certificate) (*VerifiedPeer, err
 		return nil, fmt.Errorf("parse extensions: %w", err)
 	}
 
-	// Filter out GHOSTWIRE critical extensions from UnhandledCriticalExtensions
-	// Go's x509 library rejects unknown critical extensions, but we handle ours
-	filteredCritical := filterGhostwireCriticalExtensions(cert.UnhandledCriticalExtensions)
-
-	// Temporarily clear unhandled critical extensions for verification
-	origCritical := cert.UnhandledCriticalExtensions
-	cert.UnhandledCriticalExtensions = filteredCritical
+	// Go's x509 library rejects unknown critical extensions, but we handle ours.
+	// Verify against a shallow COPY with the GHOSTWIRE critical extensions
+	// filtered out — mutating the caller's cert (as before) races when the same
+	// *x509.Certificate is verified concurrently and could leave critical-
+	// extension enforcement disabled.
+	verifyCert := *cert
+	verifyCert.UnhandledCriticalExtensions = filterGhostwireCriticalExtensions(cert.UnhandledCriticalExtensions)
 
 	// Verify certificate chain
 	opts := x509.VerifyOptions{
@@ -85,10 +85,7 @@ func (v *Verifier) VerifyCertificate(cert *x509.Certificate) (*VerifiedPeer, err
 		KeyUsages:   []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}
 
-	_, err = cert.Verify(opts)
-	cert.UnhandledCriticalExtensions = origCritical // Restore original
-
-	if err != nil {
+	if _, err = verifyCert.Verify(opts); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidChain, err)
 	}
 

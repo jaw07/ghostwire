@@ -57,7 +57,7 @@ type RenewalRequest struct {
 
 // RenewalResponse is returned after successful renewal
 type RenewalResponse struct {
-	Certificate string `json:"certificate"`  // New PEM-encoded certificate
+	Certificate string `json:"certificate"` // New PEM-encoded certificate
 	ExpiresAt   int64  `json:"expires_at"`
 	CACertChain string `json:"ca_cert_chain,omitempty"` // If CA rotated
 }
@@ -434,8 +434,12 @@ func (rh *RenewalHandler) HandleRenewal(w http.ResponseWriter, r *http.Request) 
 		AllowedNetworks: currentExt.AllowedNetworks,
 		Compartment:     currentExt.Compartment,
 		WireGuardPubKey: currentExt.WireGuardPubKey,
-		MeshIP:          currentCert.IPAddresses[0],
 		Validity:        24 * time.Hour,
+	}
+	// A cert issued without an IP SAN has an empty IPAddresses; indexing it
+	// would panic the renewal handler on an otherwise-valid request.
+	if len(currentCert.IPAddresses) > 0 {
+		certReq.MeshIP = currentCert.IPAddresses[0]
 	}
 
 	newCert, _, err := rh.ca.IssueCertificate(certReq)

@@ -172,6 +172,12 @@ func (ml *MemberList) Get(nodeID string) *Member {
 // Merge updates the member list with new member info
 // Returns true if the member was new or updated
 func (ml *MemberList) Merge(m *Member) bool {
+	// A malformed gossip payload (e.g. JSON "members":[null]) decodes to a nil
+	// member; reject it rather than dereferencing it and crashing the goroutine.
+	if m == nil {
+		return false
+	}
+
 	ml.mu.Lock()
 	defer ml.mu.Unlock()
 
@@ -182,11 +188,13 @@ func (ml *MemberList) Merge(m *Member) bool {
 
 	existing, exists := ml.members[m.NodeID]
 
-	// New member
+	// New member. Callbacks run in goroutines, so hand them a Clone — never the
+	// caller's m (mutated as the receive loop ranges the message) nor a pointer
+	// into the mutex-guarded map.
 	if !exists {
 		ml.members[m.NodeID] = m.Clone()
 		if ml.onJoin != nil {
-			go ml.onJoin(m)
+			go ml.onJoin(m.Clone())
 		}
 		return true
 	}
@@ -196,7 +204,7 @@ func (ml *MemberList) Merge(m *Member) bool {
 		// Newer info, update everything
 		ml.members[m.NodeID] = m.Clone()
 		if ml.onUpdate != nil {
-			go ml.onUpdate(m)
+			go ml.onUpdate(m.Clone())
 		}
 		return true
 	}
@@ -207,7 +215,7 @@ func (ml *MemberList) Merge(m *Member) bool {
 			existing.State = m.State
 			existing.LastSeen = m.LastSeen
 			if m.State == StateDead && ml.onLeave != nil {
-				go ml.onLeave(existing)
+				go ml.onLeave(existing.Clone())
 			}
 			return true
 		}
@@ -242,7 +250,28 @@ func (ml *MemberList) MarkDead(nodeID string) bool {
 
 	m.State = StateDead
 	if ml.onLeave != nil {
-		go ml.onLeave(m)
+		go ml.onLeave(m.Clone())
+	}
+	return true
+}
+
+// MarkDeadIfSuspect atomically confirms death only if the member is still
+// suspect. If it refuted (gossiped a higher incarnation back to Alive) during
+// the suspicion window, it is spared — preventing a recovered node from being
+// killed cluster-wide (SWIM refutation). This is the correct call from the
+// suspicion-timeout path; MarkDead remains available for unconditional kills.
+func (ml *MemberList) MarkDeadIfSuspect(nodeID string) bool {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
+
+	m, exists := ml.members[nodeID]
+	if !exists || m.State != StateSuspect {
+		return false
+	}
+
+	m.State = StateDead
+	if ml.onLeave != nil {
+		go ml.onLeave(m.Clone())
 	}
 	return true
 }
