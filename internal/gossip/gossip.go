@@ -305,6 +305,14 @@ func (g *Gossip) receiveLoop() {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
+			// Non-timeout error (e.g. an ICMP port-unreachable surfacing on the
+			// UDP socket) can return immediately; back off so a persistent one
+			// can't spin the CPU. Still honor shutdown.
+			select {
+			case <-g.shutdown:
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
 			continue
 		}
 
@@ -431,7 +439,11 @@ func (g *Gossip) handleAck(msg *Message) {
 }
 
 func (g *Gossip) handleSync(msg *Message, from net.Addr) {
-	// Full state sync requested
+	// NOTE: a digest-based fast path (skip the member list when states agree)
+	// is not possible with the current computeDigest, which hashes only the
+	// LOCAL member set excluding self — so two nodes' digests never match even
+	// when fully in sync. Making sync scale would require a canonical
+	// cluster-state digest both sides can agree on. Until then, send full state.
 	all := g.members.Members(nil)
 	all = append(all, g.members.Self())
 
