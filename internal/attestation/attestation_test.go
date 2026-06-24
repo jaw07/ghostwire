@@ -3,6 +3,7 @@ package attestation
 import (
 	"crypto/ed25519"
 	"crypto/sha256"
+	"strings"
 	"testing"
 	"time"
 )
@@ -191,6 +192,35 @@ func TestVerifierVerify(t *testing.T) {
 	}
 	if result.BinaryVersion != "v1.0.0" {
 		t.Errorf("BinaryVersion = %q, want %q", result.BinaryVersion, "v1.0.0")
+	}
+}
+
+func TestVerifierTPMFailsClosed(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+
+	v := NewVerifier(&VerifierConfig{MaxClockSkew: 5 * time.Minute, MaxAge: time.Hour})
+
+	nonce, _ := Challenge()
+	claim, _ := NewClaim("node-1", nonce)
+	claim.Type = TypeTPM
+	// A non-empty quote must NOT be accepted just for being present: without a
+	// verification path it cannot be trusted.
+	claim.TPMQuote = []byte("not-a-real-quote")
+	v.AddTrustedHashBytes(claim.BinaryHash, "v1.0.0")
+	claim.Sign(priv)
+
+	result := v.Verify(claim, pub, nonce)
+	if result.Valid {
+		t.Error("TPM claim with unverified quote should be rejected (fail closed)")
+	}
+	found := false
+	for _, iss := range result.Issues {
+		if strings.Contains(iss, "TPM quote verification not implemented") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected 'not implemented' issue, got %v", result.Issues)
 	}
 }
 

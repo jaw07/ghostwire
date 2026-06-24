@@ -311,6 +311,11 @@ func startDaemon(configDir string, foreground bool) error {
 	}
 	defer gossipService.Stop()
 
+	// Root shutdown context. Cancelling it (Ctrl+C, SIGTERM, or a GUI-initiated
+	// /disconnect) drops through to the graceful teardown at the end of Run.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Create GUI server early so gossip callbacks can reference it
 	fmt.Println("Starting GUI server...")
 	guiCfg := &gui.Config{
@@ -721,6 +726,15 @@ func startDaemon(configDir string, foreground bool) error {
 			defer os.Remove(daemonAPIPath)
 		}
 
+		// The daemon already owns the mesh lifecycle in this process, so there is
+		// no separate daemon to dial: /connect just reports state (onConnect nil),
+		// while /disconnect requests a graceful shutdown of this daemon.
+		guiServer.SetConnectionHandlers(nil, func() error {
+			fmt.Println("Disconnect requested via GUI, shutting down...")
+			cancel()
+			return nil
+		})
+
 		go func() {
 			if err := guiServer.Start(); err != nil {
 				fmt.Printf("GUI server error: %v\n", err)
@@ -765,9 +779,6 @@ func startDaemon(configDir string, foreground bool) error {
 	fmt.Println()
 
 	// Wait for shutdown signal
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 

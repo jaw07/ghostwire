@@ -172,8 +172,16 @@ func (v *Verifier) Verify(claim *Claim, publicKey ed25519.PublicKey, expectedNon
 	case TypeTPM:
 		if len(claim.TPMQuote) == 0 {
 			result.AddIssue("TPM quote missing for TPM attestation")
+		} else {
+			// Fail closed. There is no TPM quote verification path yet: no AK
+			// trust chain, no PCR policy, and no TPMS_ATTEST parser. Treating a
+			// non-empty blob as proof would be security theater — strictly worse
+			// than rejecting it, because it grants the trust of hardware
+			// attestation to an unverified value. Reject until real verification
+			// (parse the quote, check the AK signature over the PCR digest, and
+			// bind the nonce to extraData) is implemented.
+			result.AddIssue("TPM quote verification not implemented; claim cannot be trusted")
 		}
-		// TODO: Verify TPM quote
 	case TypeSGX:
 		result.AddIssue("SGX attestation not implemented")
 	}

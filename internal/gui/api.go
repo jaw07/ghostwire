@@ -125,14 +125,42 @@ func (a *API) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TODO: Actually connect to daemon
-	// For now, return success
-	a.writeJSON(w, map[string]string{"status": "connecting"})
+	// When a connect handler is wired, delegate to it (unlock + bring the mesh
+	// up). In the default deployment the daemon runs in-process with the GUI and
+	// already owns the mesh lifecycle, so there is no handler — report the
+	// actual connection state rather than a misleading "connecting".
+	if a.server != nil && a.server.onConnect != nil {
+		if err := a.server.onConnect(req.Passphrase); err != nil {
+			a.writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		a.writeJSON(w, map[string]string{"status": "connecting"})
+		return
+	}
+
+	a.mu.RLock()
+	connected := a.status != nil && a.status.Connected
+	a.mu.RUnlock()
+	state := "disconnected"
+	if connected {
+		state = "connected"
+	}
+	a.writeJSON(w, map[string]string{"status": state})
 }
 
 // handleDisconnect disconnects from the mesh
 func (a *API) handleDisconnect(w http.ResponseWriter, r *http.Request) {
-	// TODO: Actually disconnect
+	// Disconnecting tears down the running daemon, so it only works when a
+	// handler is wired to trigger graceful shutdown. Without one there is
+	// nothing this endpoint can safely do.
+	if a.server == nil || a.server.onDisconnect == nil {
+		a.writeError(w, http.StatusServiceUnavailable, "disconnect not available; stop the daemon to disconnect")
+		return
+	}
+	if err := a.server.onDisconnect(); err != nil {
+		a.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	a.writeJSON(w, map[string]string{"status": "disconnecting"})
 }
 

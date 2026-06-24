@@ -34,6 +34,8 @@ type Server struct {
 	onMAVLinkCreate func(name, protocol, listen, target string) error
 	onMAVLinkDelete func(name string) error
 	onCreateToken   func(roles []string, expires time.Duration, maxUses int, name string) (string, error)
+	onConnect       func(passphrase string) error
+	onDisconnect    func() error
 }
 
 // Config configures the GUI server
@@ -271,6 +273,18 @@ func (s *Server) SetEnrollHandler(handler func(roles []string, expires time.Dura
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onCreateToken = handler
+}
+
+// SetConnectionHandlers sets the callbacks invoked by the /connect and
+// /disconnect API endpoints. Either may be nil: in the default in-process
+// deployment the daemon owns the mesh lifecycle, so /connect simply reports the
+// current state and /disconnect is unavailable unless a handler triggers a
+// graceful shutdown.
+func (s *Server) SetConnectionHandlers(onConnect func(passphrase string) error, onDisconnect func() error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onConnect = onConnect
+	s.onDisconnect = onDisconnect
 }
 
 // SetChatHandler sets the callback invoked when a client sends a chat message
