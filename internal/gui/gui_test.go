@@ -149,6 +149,76 @@ func TestAPIConnect(t *testing.T) {
 	}
 }
 
+func TestAPIConnectReportsState(t *testing.T) {
+	s, _ := New(&Config{AuthToken: "test"})
+	s.api.SetStatus(&Status{Connected: true})
+
+	body := strings.NewReader(`{"passphrase":"secret"}`)
+	req := httptest.NewRequest("POST", "/api/connect?token=test", body)
+	w := httptest.NewRecorder()
+	s.authMiddleware(http.HandlerFunc(s.api.ServeHTTP)).ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want 200", w.Code)
+	}
+	var resp map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["status"] != "connected" {
+		t.Errorf("status = %q, want \"connected\" (no handler should report real state)", resp["status"])
+	}
+}
+
+func TestAPIConnectHandler(t *testing.T) {
+	s, _ := New(&Config{AuthToken: "test"})
+	var got string
+	s.SetConnectionHandlers(func(passphrase string) error {
+		got = passphrase
+		return nil
+	}, nil)
+
+	body := strings.NewReader(`{"passphrase":"secret"}`)
+	req := httptest.NewRequest("POST", "/api/connect?token=test", body)
+	w := httptest.NewRecorder()
+	s.authMiddleware(http.HandlerFunc(s.api.ServeHTTP)).ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want 200", w.Code)
+	}
+	if got != "secret" {
+		t.Errorf("onConnect passphrase = %q, want \"secret\"", got)
+	}
+}
+
+func TestAPIDisconnect(t *testing.T) {
+	s, _ := New(&Config{AuthToken: "test"})
+
+	// No handler wired: disconnect is unavailable.
+	req := httptest.NewRequest("POST", "/api/disconnect?token=test", nil)
+	w := httptest.NewRecorder()
+	s.authMiddleware(http.HandlerFunc(s.api.ServeHTTP)).ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("no-handler StatusCode = %d, want 503", w.Code)
+	}
+
+	// Handler wired: it is invoked and reports disconnecting.
+	called := false
+	s.SetConnectionHandlers(nil, func() error {
+		called = true
+		return nil
+	})
+	req = httptest.NewRequest("POST", "/api/disconnect?token=test", nil)
+	w = httptest.NewRecorder()
+	s.authMiddleware(http.HandlerFunc(s.api.ServeHTTP)).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("handler StatusCode = %d, want 200", w.Code)
+	}
+	if !called {
+		t.Error("onDisconnect was not invoked")
+	}
+}
+
 func TestAPINotFound(t *testing.T) {
 	s, _ := New(&Config{AuthToken: "test"})
 
