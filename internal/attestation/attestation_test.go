@@ -211,16 +211,16 @@ func TestVerifierTPMFailsClosed(t *testing.T) {
 
 	result := v.Verify(claim, pub, nonce)
 	if result.Valid {
-		t.Error("TPM claim with unverified quote should be rejected (fail closed)")
+		t.Error("TPM claim with no registered policy should be rejected (fail closed)")
 	}
 	found := false
 	for _, iss := range result.Issues {
-		if strings.Contains(iss, "TPM quote verification not implemented") {
+		if strings.Contains(iss, "TPM quote verification failed") {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("expected 'not implemented' issue, got %v", result.Issues)
+		t.Errorf("expected 'verification failed' issue, got %v", result.Issues)
 	}
 }
 

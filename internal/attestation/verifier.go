@@ -28,6 +28,7 @@ type Verifier struct {
 	mu            sync.RWMutex
 	trustedHashes map[string]string      // binary hash -> version string
 	consumed      map[[16]byte]time.Time // nonces already used (replay defense)
+	tpmPolicies   map[string]*TPMPolicy  // nodeID -> trusted TPM attestation policy
 	maxClockSkew  time.Duration
 	maxAge        time.Duration
 	requireConfig bool // Require config hash
@@ -45,6 +46,7 @@ func NewVerifier(cfg *VerifierConfig) *Verifier {
 	v := &Verifier{
 		trustedHashes: make(map[string]string),
 		consumed:      make(map[[16]byte]time.Time),
+		tpmPolicies:   make(map[string]*TPMPolicy),
 		maxClockSkew:  DefaultMaxClockSkew,
 		maxAge:        DefaultMaxAge,
 	}
@@ -172,15 +174,11 @@ func (v *Verifier) Verify(claim *Claim, publicKey ed25519.PublicKey, expectedNon
 	case TypeTPM:
 		if len(claim.TPMQuote) == 0 {
 			result.AddIssue("TPM quote missing for TPM attestation")
-		} else {
-			// Fail closed. There is no TPM quote verification path yet: no AK
-			// trust chain, no PCR policy, and no TPMS_ATTEST parser. Treating a
-			// non-empty blob as proof would be security theater — strictly worse
-			// than rejecting it, because it grants the trust of hardware
-			// attestation to an unverified value. Reject until real verification
-			// (parse the quote, check the AK signature over the PCR digest, and
-			// bind the nonce to extraData) is implemented.
-			result.AddIssue("TPM quote verification not implemented; claim cannot be trusted")
+		} else if err := v.verifyTPMQuote(claim); err != nil {
+			// Fail closed: any error (no registered policy, bad signature, stale
+			// nonce, or PCR mismatch) rejects the claim. An unverified quote must
+			// never inherit the trust of hardware attestation.
+			result.AddIssue("TPM quote verification failed: " + err.Error())
 		}
 	case TypeSGX:
 		result.AddIssue("SGX attestation not implemented")
