@@ -7,7 +7,6 @@ require (
 	filippo.io/edwards25519 v1.1.0
 	github.com/cloudflare/circl v1.6.3
 	github.com/google/cel-go v0.27.0
-	github.com/google/go-tpm v0.9.8
 	github.com/gorilla/websocket v1.5.3
 	github.com/miekg/dns v1.1.72
 	github.com/quic-go/quic-go v0.59.0
