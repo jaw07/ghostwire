@@ -52,8 +52,7 @@ type Claim struct {
 	ConfigHash [32]byte
 	SystemInfo SystemInfo
 	Nonce      [16]byte // Challenge nonce for freshness
-	TPMQuote   []byte   // Optional TPM quote (TPMS_ATTEST), present for TypeTPM
-	TPMSig     []byte   // AK signature over TPMQuote (TPMT_SIGNATURE), present for TypeTPM
+	TPMQuote   []byte   // Optional TPM quote
 	Signature  []byte   // Signed by node key
 }
 
@@ -117,25 +116,6 @@ func NewClaim(nodeID string, nonce [16]byte) (*Claim, error) {
 		SystemInfo: GatherSystemInfo(),
 		Nonce:      nonce,
 	}, nil
-}
-
-// NewTPMClaim creates a TPM-backed attestation claim. quote is the marshaled
-// TPMS_ATTEST structure returned by the node's TPM (via go-tpm tpm2.Quote, with
-// the challenge nonce supplied as the qualifying data) and sig is the
-// accompanying TPMT_SIGNATURE produced by the Attestation Key over that quote.
-//
-// Producing these bytes requires access to the node's TPM hardware; the
-// verification side (Verifier.Verify against a registered TPMPolicy) is
-// hardware-free and fully exercised by the package tests.
-func NewTPMClaim(nodeID string, nonce [16]byte, quote, sig []byte) (*Claim, error) {
-	c, err := NewClaim(nodeID, nonce)
-	if err != nil {
-		return nil, err
-	}
-	c.Type = TypeTPM
-	c.TPMQuote = quote
-	c.TPMSig = sig
-	return c, nil
 }
 
 // SetConfigHash sets the config hash (excluding secrets)

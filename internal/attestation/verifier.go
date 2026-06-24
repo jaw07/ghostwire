@@ -28,7 +28,6 @@ type Verifier struct {
 	mu            sync.RWMutex
 	trustedHashes map[string]string      // binary hash -> version string
 	consumed      map[[16]byte]time.Time // nonces already used (replay defense)
-	tpmPolicies   map[string]*TPMPolicy  // nodeID -> trusted TPM attestation policy
 	maxClockSkew  time.Duration
 	maxAge        time.Duration
 	requireConfig bool // Require config hash
@@ -46,7 +45,6 @@ func NewVerifier(cfg *VerifierConfig) *Verifier {
 	v := &Verifier{
 		trustedHashes: make(map[string]string),
 		consumed:      make(map[[16]byte]time.Time),
-		tpmPolicies:   make(map[string]*TPMPolicy),
 		maxClockSkew:  DefaultMaxClockSkew,
 		maxAge:        DefaultMaxAge,
 	}
@@ -172,14 +170,10 @@ func (v *Verifier) Verify(claim *Claim, publicKey ed25519.PublicKey, expectedNon
 	case TypeSoftware:
 		// Software attestation only verifies binary hash (done above)
 	case TypeTPM:
-		if len(claim.TPMQuote) == 0 {
-			result.AddIssue("TPM quote missing for TPM attestation")
-		} else if err := v.verifyTPMQuote(claim); err != nil {
-			// Fail closed: any error (no registered policy, bad signature, stale
-			// nonce, or PCR mismatch) rejects the claim. An unverified quote must
-			// never inherit the trust of hardware attestation.
-			result.AddIssue("TPM quote verification failed: " + err.Error())
-		}
+		// TPM attestation needs a hardware root of trust (a TPM 2.0 device),
+		// which ghostwire intentionally does not depend on. Fail closed rather
+		// than accept an unverifiable quote.
+		result.AddIssue("TPM attestation not supported")
 	case TypeSGX:
 		result.AddIssue("SGX attestation not implemented")
 	}

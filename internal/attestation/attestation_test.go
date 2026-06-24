@@ -203,24 +203,24 @@ func TestVerifierTPMFailsClosed(t *testing.T) {
 	nonce, _ := Challenge()
 	claim, _ := NewClaim("node-1", nonce)
 	claim.Type = TypeTPM
-	// A non-empty quote must NOT be accepted just for being present: without a
-	// verification path it cannot be trusted.
+	// TPM attestation is unsupported (no hardware dependency), so even a
+	// well-formed-looking claim must be rejected rather than trusted.
 	claim.TPMQuote = []byte("not-a-real-quote")
 	v.AddTrustedHashBytes(claim.BinaryHash, "v1.0.0")
 	claim.Sign(priv)
 
 	result := v.Verify(claim, pub, nonce)
 	if result.Valid {
-		t.Error("TPM claim with no registered policy should be rejected (fail closed)")
+		t.Error("TPM claim should be rejected (fail closed)")
 	}
 	found := false
 	for _, iss := range result.Issues {
-		if strings.Contains(iss, "TPM quote verification failed") {
+		if strings.Contains(iss, "TPM attestation not supported") {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("expected 'verification failed' issue, got %v", result.Issues)
+		t.Errorf("expected 'not supported' issue, got %v", result.Issues)
 	}
 }
 
