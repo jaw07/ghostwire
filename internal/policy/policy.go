@@ -7,7 +7,6 @@ import (
 	"sync"
 
 	"github.com/google/cel-go/cel"
-	"github.com/google/cel-go/checker/decls"
 )
 
 // Effect is the result of a policy evaluation
@@ -147,20 +146,18 @@ type Engine struct {
 func NewEngine() (*Engine, error) {
 	// Create CEL environment with custom declarations
 	env, err := cel.NewEnv(
-		cel.Declarations(
-			decls.NewVar("source_node_id", decls.String),
-			decls.NewVar("source_roles", decls.NewListType(decls.String)),
-			decls.NewVar("source_compartment", decls.String),
-			decls.NewVar("source_ip", decls.String),
-			decls.NewVar("dest_node_id", decls.String),
-			decls.NewVar("dest_roles", decls.NewListType(decls.String)),
-			decls.NewVar("dest_compartment", decls.String),
-			decls.NewVar("dest_ip", decls.String),
-			decls.NewVar("dest_port", decls.Int),
-			decls.NewVar("protocol", decls.String),
-			decls.NewVar("direction", decls.String),
-			decls.NewVar("metadata", decls.NewMapType(decls.String, decls.String)),
-		),
+		cel.Variable("source_node_id", cel.StringType),
+		cel.Variable("source_roles", cel.ListType(cel.StringType)),
+		cel.Variable("source_compartment", cel.StringType),
+		cel.Variable("source_ip", cel.StringType),
+		cel.Variable("dest_node_id", cel.StringType),
+		cel.Variable("dest_roles", cel.ListType(cel.StringType)),
+		cel.Variable("dest_compartment", cel.StringType),
+		cel.Variable("dest_ip", cel.StringType),
+		cel.Variable("dest_port", cel.IntType),
+		cel.Variable("protocol", cel.StringType),
+		cel.Variable("direction", cel.StringType),
+		cel.Variable("metadata", cel.MapType(cel.StringType, cel.StringType)),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create CEL environment: %w", err)

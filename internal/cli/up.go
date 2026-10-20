@@ -646,8 +646,13 @@ func startDaemon(configDir string, foreground bool) error {
 			return fmt.Errorf("decode mesh secret: %w", err)
 		}
 
-		// Generate self-signed TLS certificate for enrollment server
-		tlsCert, err := generateTLSCert(meshConfig.Transport.HTTPS.ServerName)
+		// The enrollment server's TLS certificate is signed by the mesh CA and
+		// the CA cert is sent in the chain, so joining nodes can pin the session
+		// to the mesh ID in their token before transmitting it (see join.go).
+		if !ca.CanSign() {
+			return fmt.Errorf("enrollment server requires the mesh CA private key")
+		}
+		tlsCert, err := generateTLSCertWithCA(meshConfig.Transport.HTTPS.ServerName, ca.RootCert, ca.RootKey())
 		if err != nil {
 			return fmt.Errorf("generate TLS cert: %w", err)
 		}

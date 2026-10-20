@@ -62,15 +62,3 @@ func Execute() error {
 	}
 	return nil
 }
-
-// getConfigPath returns the config file path, using default if not specified
-func getConfigPath() string {
-	if cfgFile != "" {
-		return cfgFile
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ".config/gw/config.enc"
-	}
-	return home + "/.config/gw/config.enc"
-}

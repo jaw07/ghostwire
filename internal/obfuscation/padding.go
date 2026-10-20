@@ -8,7 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	mrand "math/rand"
+	mrand "math/rand/v2"
 	"net"
 	"sync"
 	"time"
@@ -61,6 +61,18 @@ func DefaultPaddingConfig() *PaddingConfig {
 	}
 }
 
+// newSecureRNG returns a math/rand/v2 generator backed by ChaCha8 and seeded
+// from crypto/rand. Padding sizes, jitter delays, and decoy intervals are
+// observable on the wire; a predictable generator (math/rand v1) would let an
+// observer recover the state from a few samples and strip the obfuscation.
+func newSecureRNG() *mrand.Rand {
+	var seed [32]byte
+	if _, err := rand.Read(seed[:]); err != nil {
+		panic("obfuscation: crypto/rand unavailable: " + err.Error())
+	}
+	return mrand.New(mrand.NewChaCha8(seed)) // #nosec G404 -- ChaCha8 seeded from crypto/rand is cryptographically secure
+}
+
 // Padder adds padding to packets
 type Padder struct {
 	cfg *PaddingConfig
@@ -74,12 +86,9 @@ func NewPadder(cfg *PaddingConfig) *Padder {
 		cfg = DefaultPaddingConfig()
 	}
 
-	seed := make([]byte, 8)
-	rand.Read(seed)
-
 	return &Padder{
 		cfg: cfg,
-		rng: mrand.New(mrand.NewSource(int64(binary.BigEndian.Uint64(seed)))),
+		rng: newSecureRNG(),
 	}
 }
 
@@ -149,7 +158,7 @@ func (p *Padder) selectTargetSize(dataLen int) int {
 		// non-positive argument.
 		padding := p.cfg.MinPadding
 		if span := p.cfg.MaxPadding - p.cfg.MinPadding + 1; span > 0 {
-			padding += p.rng.Intn(span)
+			padding += p.rng.IntN(span)
 		}
 		return dataLen + 2 + padding
 
@@ -223,12 +232,9 @@ func NewJitterer(cfg *JitterConfig) *Jitterer {
 		cfg = DefaultJitterConfig()
 	}
 
-	seed := make([]byte, 8)
-	rand.Read(seed)
-
 	return &Jitterer{
 		cfg: cfg,
-		rng: mrand.New(mrand.NewSource(int64(binary.BigEndian.Uint64(seed)))),
+		rng: newSecureRNG(),
 	}
 }
 
@@ -286,12 +292,12 @@ func (j *Jitterer) randomDelay() time.Duration {
 
 	switch j.cfg.Distribution {
 	case "uniform":
-		delayNs = minNs + j.rng.Int63n(rangeNs)
+		delayNs = minNs + j.rng.Int64N(rangeNs)
 
 	case "exponential":
 		// Exponential distribution - more small delays, fewer large
 		lambda := 1.0 / float64(rangeNs/2)
-		expVal := -1.0 / lambda * float64(j.rng.Int63n(1000000)) / 1000000.0
+		expVal := -1.0 / lambda * float64(j.rng.Int64N(1000000)) / 1000000.0
 		delayNs = minNs + int64(expVal)
 		if delayNs > maxNs {
 			delayNs = maxNs
@@ -366,12 +372,9 @@ func NewDecoyGenerator(cfg *DecoyConfig, conn net.Conn) *DecoyGenerator {
 		cfg = DefaultDecoyConfig()
 	}
 
-	seed := make([]byte, 8)
-	rand.Read(seed)
-
 	return &DecoyGenerator{
 		cfg:    cfg,
-		rng:    mrand.New(mrand.NewSource(int64(binary.BigEndian.Uint64(seed)))),
+		rng:    newSecureRNG(),
 		conn:   conn,
 		stopCh: make(chan struct{}),
 	}
@@ -432,20 +435,20 @@ func (d *DecoyGenerator) nextInterval() time.Duration {
 		// Simulate web browsing: bursts followed by pauses
 		if d.rng.Float32() < 0.3 {
 			// Short burst interval
-			return time.Duration(minNs + d.rng.Int63n(span)/10)
+			return time.Duration(minNs + d.rng.Int64N(span)/10)
 		}
 		// Longer pause
-		return time.Duration(minNs + d.rng.Int63n(span))
+		return time.Duration(minNs + d.rng.Int64N(span))
 	}
 
-	return time.Duration(minNs + d.rng.Int63n(span))
+	return time.Duration(minNs + d.rng.Int64N(span))
 }
 
 func (d *DecoyGenerator) sendDecoy() {
 	d.mu.Lock()
 	size := d.cfg.MinSize
 	if span := d.cfg.MaxSize - d.cfg.MinSize; span > 0 {
-		size += d.rng.Intn(span)
+		size += d.rng.IntN(span)
 	}
 	d.mu.Unlock()
 
@@ -497,8 +500,6 @@ type ObfuscatedConn struct {
 
 // NewObfuscatedConn creates an obfuscated connection wrapper
 func NewObfuscatedConn(conn net.Conn, padCfg *PaddingConfig, jitCfg *JitterConfig, decoyCfg *DecoyConfig) *ObfuscatedConn {
-	seed := make([]byte, 8)
-	rand.Read(seed)
 
 	oc := &ObfuscatedConn{
 		Conn:     conn,
@@ -506,7 +507,7 @@ func NewObfuscatedConn(conn net.Conn, padCfg *PaddingConfig, jitCfg *JitterConfi
 		jitterer: NewJitterer(jitCfg),
 		br:       bufio.NewReader(conn),
 		decoyCfg: decoyCfg,
-		rng:      mrand.New(mrand.NewSource(int64(binary.BigEndian.Uint64(seed)))),
+		rng:      newSecureRNG(),
 		done:     make(chan struct{}),
 	}
 
@@ -635,7 +636,7 @@ func (oc *ObfuscatedConn) decoyInterval() time.Duration {
 	minNs := oc.decoyCfg.MinInterval.Nanoseconds()
 	maxNs := oc.decoyCfg.MaxInterval.Nanoseconds()
 	if span := maxNs - minNs; span > 0 {
-		return time.Duration(minNs + oc.rng.Int63n(span))
+		return time.Duration(minNs + oc.rng.Int64N(span))
 	}
 	if minNs <= 0 {
 		return time.Second // avoid a hot loop on zero config
@@ -646,7 +647,7 @@ func (oc *ObfuscatedConn) decoyInterval() time.Duration {
 func (oc *ObfuscatedConn) decoySize() int {
 	size := oc.decoyCfg.MinSize
 	if span := oc.decoyCfg.MaxSize - oc.decoyCfg.MinSize; span > 0 {
-		size += oc.rng.Intn(span)
+		size += oc.rng.IntN(span)
 	}
 	if size < 0 {
 		size = 0

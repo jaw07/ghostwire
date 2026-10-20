@@ -147,9 +147,13 @@ func NewEnrollmentServer(cfg *ServerConfig) (*EnrollmentServer, error) {
 	}
 
 	s.server = &http.Server{
-		Addr:      cfg.ListenAddr,
-		Handler:   mux,
-		TLSConfig: tlsConfig,
+		Addr:              cfg.ListenAddr,
+		Handler:           mux,
+		TLSConfig:         tlsConfig,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	return s, nil
