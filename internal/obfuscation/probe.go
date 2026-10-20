@@ -160,7 +160,6 @@ type ProbeResistantServer struct {
 	cfg         *ProbeResistanceConfig
 	realHandler http.Handler
 	rateLimiter *rateLimiter
-	mu          sync.RWMutex
 }
 
 // NewProbeResistantServer creates a probe-resistant server wrapper
@@ -571,7 +570,6 @@ func (pd *ProbeDetector) IsKnownProber(ip string) bool {
 type ProbeResistantListener struct {
 	net.Listener
 	detector *ProbeDetector
-	handler  func(net.Conn) bool // Returns true if connection should proceed
 }
 
 // NewProbeResistantListener creates a probe-resistant listener

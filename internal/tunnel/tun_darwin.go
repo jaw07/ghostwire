@@ -28,15 +28,6 @@ func configureTunnel(ifname string, ip netip.Addr, subnet netip.Prefix) error {
 	return nil
 }
 
-// removeTunnel removes tunnel configuration on macOS
-func removeTunnel(ifname string, subnet netip.Prefix) error {
-	// Remove route
-	_ = runCommand("route", "-n", "delete", "-net", subnet.String())
-
-	// Interface is automatically cleaned up when closed
-	return nil
-}
-
 func runCommand(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	if output, err := cmd.CombinedOutput(); err != nil {

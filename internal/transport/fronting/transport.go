@@ -154,7 +154,6 @@ type frontedConn struct {
 	localAddr  net.Addr
 	remoteAddr net.Addr
 	upgraded   bool
-	mu         sync.Mutex
 }
 
 // upgrade performs the HTTP upgrade to tunnel mode

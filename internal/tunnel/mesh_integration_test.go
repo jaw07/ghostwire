@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -227,9 +228,68 @@ func (n *testNode) addPeer(t *testing.T, peer *testNode, peerAddr string) {
 	}
 }
 
+// addPassivePeer adds a peer with no endpoint and no keepalive, so this node
+// never initiates a handshake and learns the peer's endpoint from its first
+// packet. Exactly one side of each pair must initiate: on the in-memory bind
+// both sides sending an initiation in the same instant makes each reject the
+// other's response as stale, and wireguard-go then suppresses the retry
+// because the response it just sent is within RekeyTimeout of "now".
+func (n *testNode) addPassivePeer(t *testing.T, peer *testNode) {
+	t.Helper()
+	ipc := fmt.Sprintf(
+		"public_key=%s\nallowed_ip=%s/32\n",
+		hex.EncodeToString(peer.publicKey[:]),
+		peer.meshIP.String(),
+	)
+	if err := n.wgDev.IpcSet(ipc); err != nil {
+		t.Fatalf("%s: add passive peer %s: %v", n.name, peer.name, err)
+	}
+}
+
 func (n *testNode) close() {
 	n.wgDev.Close()
 	n.bind.Close()
+}
+
+// waitForHandshake polls every node until each of its peers reports a
+// completed handshake, or fails the test on timeout. A fixed sleep is not
+// reliable under the race detector on a loaded machine.
+func waitForHandshake(t *testing.T, timeout time.Duration, nodes ...*testNode) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		done := true
+		for _, n := range nodes {
+			if !n.handshaked() {
+				done = false
+				break
+			}
+		}
+		if done {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("WireGuard handshake did not complete within %s", timeout)
+}
+
+// handshaked reports whether every configured peer has a non-zero
+// last_handshake_time.
+func (n *testNode) handshaked() bool {
+	state, err := n.wgDev.IpcGet()
+	if err != nil {
+		return false
+	}
+	peers, complete := 0, 0
+	for _, line := range strings.Split(state, "\n") {
+		if strings.HasPrefix(line, "public_key=") {
+			peers++
+		}
+		if v, ok := strings.CutPrefix(line, "last_handshake_time_sec="); ok && v != "0" {
+			complete++
+		}
+	}
+	return peers > 0 && complete == peers
 }
 
 // --- Tests ---
@@ -251,10 +311,10 @@ func TestTwoNodeTunnel(t *testing.T) {
 
 	// Now add peers (triggers handshake with bind already open)
 	nodeA.addPeer(t, nodeB, "10.0.0.2:1")
-	nodeB.addPeer(t, nodeA, "10.0.0.1:1")
+	nodeB.addPassivePeer(t, nodeA)
 
-	t.Log("WireGuard handshake should happen automatically...")
-	time.Sleep(2 * time.Second)
+	t.Log("Waiting for WireGuard handshake...")
+	waitForHandshake(t, 30*time.Second, nodeA, nodeB)
 
 	// --- Test TCP traffic A -> B ---
 	t.Log("Testing TCP: alpha -> bravo...")
@@ -313,7 +373,7 @@ func TestTwoNodeTunnel(t *testing.T) {
 
 	// Read echo
 	buf := make([]byte, 4096)
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 	n, err := conn.Read(buf)
 	if err != nil {
 		t.Fatalf("alpha read echo: %v", err)
@@ -364,14 +424,14 @@ func TestThreeNodeMesh(t *testing.T) {
 	nodeA.addPeer(t, nodeB, "10.0.0.2:1")
 	nodeA.addPeer(t, nodeC, "10.0.0.3:1")
 
-	nodeB.addPeer(t, nodeA, "10.0.0.1:1")
+	nodeB.addPassivePeer(t, nodeA)
 	nodeB.addPeer(t, nodeC, "10.0.0.3:1")
 
-	nodeC.addPeer(t, nodeA, "10.0.0.1:1")
-	nodeC.addPeer(t, nodeB, "10.0.0.2:1")
+	nodeC.addPassivePeer(t, nodeA)
+	nodeC.addPassivePeer(t, nodeB)
 
 	t.Log("Waiting for WireGuard handshakes...")
-	time.Sleep(2 * time.Second)
+	waitForHandshake(t, 30*time.Second, nodeA, nodeB, nodeC)
 
 	// Test all 6 directional paths concurrently
 	type pathTest struct {
@@ -494,9 +554,9 @@ func TestBulkDataTransfer(t *testing.T) {
 	nodeA.wgDev.Up()
 	nodeB.wgDev.Up()
 	nodeA.addPeer(t, nodeB, "10.0.0.2:1")
-	nodeB.addPeer(t, nodeA, "10.0.0.1:1")
+	nodeB.addPassivePeer(t, nodeA)
 
-	time.Sleep(2 * time.Second)
+	waitForHandshake(t, 30*time.Second, nodeA, nodeB)
 
 	// Generate 1MB of test data
 	dataSize := 1024 * 1024

@@ -212,7 +212,6 @@ func decodeWSFrame(r io.Reader, lenMask [2]byte) ([]byte, error) {
 // HTTPSBind implements conn.Bind for tunneling WireGuard over HTTPS
 type HTTPSBind struct {
 	transport   *https.Transport
-	localAddr   net.Addr
 	remoteConns map[string]*httpsEndpoint // endpoint string -> connection
 	connsMu     sync.RWMutex
 	recvChan    chan recvPacket
@@ -244,9 +243,8 @@ type recvPacket struct {
 }
 
 type httpsEndpoint struct {
-	conn       net.Conn
-	addr       string
-	lastActive time.Time
+	conn net.Conn
+	addr string
 }
 
 func (e *httpsEndpoint) ClearSrc() {}
@@ -717,13 +715,6 @@ func (b *HybridBind) ParseEndpoint(s string) (conn.Endpoint, error) {
 
 func (b *HybridBind) BatchSize() int {
 	return 1
-}
-
-// Listener for server-side HTTPS connections
-type HTTPSListener struct {
-	transport *https.Transport
-	listener  net.Listener
-	bind      *HTTPSBind
 }
 
 // StartHTTPSListener starts listening for incoming HTTPS connections.

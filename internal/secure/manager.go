@@ -18,7 +18,6 @@ const (
 type Manager struct {
 	mu           sync.RWMutex
 	compartments map[string]*Compartment
-	totalLocked  int
 	maxLocked    int
 	closed       bool
 }

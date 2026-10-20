@@ -172,12 +172,21 @@ func joinMesh(tokenStr, endpoint, nodeName, configDir string) error {
 		return fmt.Errorf("marshal request: %w", err)
 	}
 
-	// Create HTTPS client (skip verify since we don't have CA yet)
+	// Create HTTPS client. We have no CA bundle yet, so the system verifier is
+	// disabled and replaced by pinnedMeshCAVerifier: the admin node's TLS cert
+	// must chain to a CA whose Ed25519 public key hashes to the token's mesh
+	// ID. This runs BEFORE the one-time enrollment token leaves this host, so
+	// an on-path attacker cannot capture the token and enroll in our place.
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, // We verify the response cert manually
+				MinVersion:         tls.VersionTLS13,
+				InsecureSkipVerify: true, // chain is verified by VerifyConnection below
+				// VerifyConnection (not VerifyPeerCertificate) so the check also
+				// runs on resumed sessions; resumption is disabled regardless.
+				SessionTicketsDisabled: true,
+				VerifyConnection:       pinnedMeshCAVerifier(tok.MeshID),
 			},
 		},
 	}
@@ -336,6 +345,50 @@ func transportPortFromConfig(tc config.TransportConfig) string {
 		}
 	}
 	return "8444"
+}
+
+// pinnedMeshCAVerifier returns a tls.Config.VerifyConnection callback that
+// accepts the presented chain only if it contains a CA certificate whose
+// Ed25519 public key hashes (SHA-256) to expectedMeshID, and the leaf
+// certificate validly chains to that CA. Hostname matching is skipped because
+// the admin node's TLS cert carries its own ServerName, not the enrollment
+// endpoint address. This pins the enrollment TLS session to the mesh CA using
+// only the mesh ID already embedded in the enrollment token.
+func pinnedMeshCAVerifier(expectedMeshID [32]byte) func(cs tls.ConnectionState) error {
+	return func(cs tls.ConnectionState) error {
+		certs := cs.PeerCertificates
+		if len(certs) == 0 {
+			return fmt.Errorf("enrollment server presented no certificate")
+		}
+
+		roots := x509.NewCertPool()
+		intermediates := x509.NewCertPool()
+		pinned := false
+		for _, c := range certs[1:] {
+			if edPub, ok := c.PublicKey.(ed25519.PublicKey); ok {
+				id := sha256.Sum256(edPub)
+				if subtle.ConstantTimeCompare(id[:], expectedMeshID[:]) == 1 {
+					roots.AddCert(c)
+					pinned = true
+					continue
+				}
+			}
+			intermediates.AddCert(c)
+		}
+		if !pinned {
+			return fmt.Errorf("enrollment server certificate chain does not include the mesh CA (mesh ID mismatch; possible MITM)")
+		}
+
+		_, err := certs[0].Verify(x509.VerifyOptions{
+			Roots:         roots,
+			Intermediates: intermediates,
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		})
+		if err != nil {
+			return fmt.Errorf("enrollment server certificate does not chain to mesh CA: %w", err)
+		}
+		return nil
+	}
 }
 
 // verifyCAFingerprint checks that the CA certificate's public key hash matches
