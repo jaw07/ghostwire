@@ -4,7 +4,7 @@ Mesh VPN with traffic obfuscation. WireGuard tunnels wrapped in WebSocket-framed
 
 ## Building
 
-Go 1.24+.
+Go 1.26+ (go.mod pins toolchain go1.26.9; `go` downloads it automatically).
 
 ```bash
 make build          # current platform
@@ -26,6 +26,7 @@ ghostwire up -f
 
 # Create enrollment token against the RUNNING daemon (no passphrase, honored
 # immediately). enroll create still works offline against the encrypted config.
+# token list / token revoke <id-prefix> manage existing tokens the same way.
 ghostwire token create --role operator --expires 1h
 
 # Join from another node
@@ -57,16 +58,19 @@ Mesh
   Certificate renewal (nonce-protected)
 Transport
   HTTPS-mimic: TLS 1.3 -> HTTP POST knock -> 101 WebSocket upgrade -> binary frames
-  QUIC, domain fronting, DNS-over-HTTPS, direct UDP
+  Direct UDP, or hybrid (direct with HTTPS-mimic fallback)
+  QUIC, domain fronting, DNS-over-HTTPS: packages exist, not wired into the daemon
 Tunnel
   WireGuard via wireguard-go
   Custom conn.Bind routes packets through transport layer
   Peers added dynamically via gossip callbacks
 Crypto
   Ed25519 signing, X25519 key agreement
-  Hybrid X25519 + Kyber-768 (post-quantum)
   age + scrypt config encryption
+  Hybrid X25519 + Kyber-768 (post-quantum): package exists, not wired into the daemon
 ```
+
+Also present under `internal/` but not yet started by `ghostwire up`: `attestation` (software binary-hash claims), `canary` (dead-man check-in), `secure` (mlock'd compartments), `logging` (encrypted rotating logs), and the timing-jitter and decoy-traffic halves of `obfuscation`.
 
 ## Transport protocol
 
@@ -170,23 +174,31 @@ Admin                                            New Node
   |     token = Sign(CA_key, {id, mesh_id,         |
   |       roles, not_before, not_after, max_uses}) |
   |                                                |
-  |<--- POST /enroll {token, pubkey} --------------| 2. Generate Ed25519 + X25519
+  |<--- TLS 1.3 handshake -------------------------| 2. Generate Ed25519 + X25519
+  |     server cert signed by mesh CA,             |
+  |     CA cert included in chain                  |
+  |                                                | 3. Node pins the session:
+  |                                                |    chain must contain a CA with
+  |                                                |    SHA-256(pubkey) == token.mesh_id
+  |                                                |    and the leaf must chain to it
   |                                                |
-  |  3. Validate token signature                   |
+  |<--- POST /enroll {token, pubkey} --------------| 4. Token sent only after pin
+  |                                                |
+  |  5. Validate token signature                   |
   |     Check expiry, usage count                  |
   |     Allocate mesh IP                           |
   |     Issue X.509 certificate                    |
   |                                                |
-  |--- {cert, ca_cert, peers, -------------------->| 4. Mesh config response
+  |--- {cert, ca_cert, peers, -------------------->| 6. Mesh config response
   |     mesh_secret, transport}                    |
   |                                                |
-  |                                                | 5. Node verifies:
+  |                                                | 7. Node re-verifies:
   |                                                |    SHA-256(ca_cert.pubkey)
   |                                                |      == token.mesh_id
   |                                                |    cert chains to ca_cert
 ```
 
-Step 5 prevents MITM: an attacker substituting a rogue CA would fail the fingerprint check because the mesh ID is embedded in the token signed by the real CA. The node performs this verification **before** reading or storing any response data (mesh secret, assigned IP, peer list).
+Step 3 prevents MITM: the joining node has no CA bundle yet, so the system verifier is disabled and replaced by a `VerifyConnection` hook that pins the TLS chain to the mesh ID embedded in the token (session resumption is disabled so the hook always runs). The one-time enrollment token is never transmitted to an unpinned server. Step 7 repeats the check on the response body before any of it (mesh secret, assigned IP, peer list) is read or stored.
 
 Tokens can be minted two ways:
 - `ghostwire token create` — calls the **running daemon** over its loopback API. The token is added to the in-memory config, so the enrollment server honors it immediately (no restart) and the on-disk config is not decrypted a second time. Preferred for a live admin node.
@@ -195,6 +207,8 @@ Tokens can be minted two ways:
 A node's advertised transport endpoint comes from `Transport.HTTPS.AdvertiseEndpoint` (set via `init --advertise`) when present, otherwise the admin host + transport port.
 
 ### Certificate renewal
+
+**Status: client only.** Non-admin nodes start a renewal service (`internal/pki/renewal.go`) that builds and signs the request below, but the admin's enrollment server currently registers only `/enroll` and `/health`, so there is no `/renew` handler to answer it. Nodes whose 24-hour certificate lapses must rejoin until the server side lands.
 
 ```
 Node                                           Admin
@@ -363,7 +377,7 @@ For each rule (sorted by priority desc):
 No rules matched --> Deny (default)
 ```
 
-CEL variables available: `source_node_id`, `source_roles`, `source_ip`, `dest_node_id`, `dest_roles`, `dest_ip`, `dest_port`, `protocol`, `direction`, `metadata`.
+CEL variables available: `source_node_id`, `source_roles`, `source_compartment`, `source_ip`, `dest_node_id`, `dest_roles`, `dest_compartment`, `dest_ip`, `dest_port`, `protocol`, `direction`, `metadata`.
 
 ## WireGuard integration
 
@@ -454,6 +468,8 @@ Traffic path:
 
 ## Post-quantum key exchange
 
+**Status: library only.** `internal/pqc` implements the exchange below and is tested, but nothing in the daemon calls it yet; the tunnel's key agreement is WireGuard's classical Noise IK. It is kept as the building block for a future PQ-protected transport handshake.
+
 Hybrid X25519 + Kyber-768 (ML-KEM). Both must be broken to recover the shared secret.
 
 ```
@@ -482,10 +498,9 @@ Alice                                            Bob
   |    info = label || scheme || x25519_eph ||     |
   |           kyber_ct || recipient_x25519 ||      |
   |           recipient_kyber)                     |
-  |                                                |
-  |  encryption_key = shared[0:32]                 |  ChaCha20-Poly1305
-  |  mac_key        = shared[32:64]                |
 ```
+
+The package returns the 64-byte combined secret; splitting it into cipher and MAC keys is left to the caller.
 
 Security: 128-bit classical (X25519) + 128-bit post-quantum (Kyber-768); both must break to recover the secret. The combined key is derived with **HKDF-SHA512 bound to the full handshake transcript** (scheme tag, ephemeral, ciphertext, and both recipient public keys), not a bare hash of the two shared secrets — so an active attacker cannot substitute KEM material without changing the derived key. Kyber/X25519 input lengths are validated before use, since the underlying KEM panics on malformed input (otherwise a remote DoS).
 
@@ -518,17 +533,19 @@ Node A (behind NAT)            Relay             Node B (behind NAT)
 NAT classification via STUN:
 
 ```
-+----------------------------+------------------------------------------+
-| Condition                  | Classification                           |
-+----------------------------+------------------------------------------+
-| A1:P1 == local addr        | NATNone       - public IP, no NAT        |
-| A1 == A2 and P1 == P2      | NATFull       - full cone                |
-| A1 == A2 and P1 != P2      | NATRestricted - port-restricted cone     |
-| A1 != A2                   | NATSymmetric  - not hole-punchable       |
-+----------------------------+------------------------------------------+
++----------------------------+----------------------------------------------+
+| Condition                  | Classification                               |
++----------------------------+----------------------------------------------+
+| no STUN server reachable   | NATUnknown                                   |
+| A1:P1 == local addr        | NATNone           - public IP, no NAT        |
+| A1:P1 == A2:P2             | NATPortRestricted - conservative assumption  |
+| A1:P1 != A2:P2             | NATSymmetric      - not hole-punchable       |
++----------------------------+----------------------------------------------+
 A1:P1 = external addr from STUN server 1
 A2:P2 = external addr from STUN server 2
 ```
+
+Distinguishing full-cone from restricted-cone NAT would need the extra STUN change-request tests; the detector does not run them, so any consistent mapping is treated as port-restricted (still hole-punchable).
 
 ## Chat
 
@@ -643,6 +660,7 @@ System IDs: 1-200 drones, 200-254 ground stations, 255 default GCS.
 | relay | Full mesh, forwards for NAT'd nodes |
 | operator | Operators, relays, admin |
 | sensor | Egress-only to collectors |
+| endpoint | Network endpoint, receives traffic |
 
 ## Config
 
@@ -685,7 +703,7 @@ bash testdata/mesh-test/run-mesh-test.sh
 
 ## Requirements
 
-- Go 1.24+
+- Go 1.26+
 - Root/admin for TUN device
 - macOS, Linux, or Windows
 - Docker (optional, for integration tests)
