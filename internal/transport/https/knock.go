@@ -207,7 +207,7 @@ func (kv *KnockValidator) Validate(req *http.Request) []byte {
 
 			// Constant-time comparison to prevent timing attacks
 			if hmac.Equal(presentedKnock, expectedKnock[:48]) {
-				// Mark as used — expires after 2 windows to cover clock skew
+				// Mark as used — kept for 3 windows, covering the {W-1, W, W+1} skew range
 				kv.seenMu.Lock()
 				kv.seenKnocks[knockKey] = now + windowSecs*3
 				kv.seenMu.Unlock()
